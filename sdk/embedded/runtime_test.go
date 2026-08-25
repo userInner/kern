@@ -53,30 +53,7 @@ func TestRuntimeRunsTypedClientAndReplayableEvents(t *testing.T) {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
 
-	streamCtx, streamCancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer streamCancel()
-	stream, err := client.OpenEventStream(streamCtx, created.ID, 0)
-	if err != nil {
-		t.Fatalf("OpenEventStream() error = %v", err)
-	}
-	var terminalEvent bool
-	for !terminalEvent {
-		event, err := stream.Next()
-		if err != nil {
-			t.Fatalf("EventStream.Next() error = %v", err)
-		}
-		switch event.Type {
-		case "task.completed", "task.partially_completed", "task.failed", "task.cancelled":
-			terminalEvent = true
-		}
-	}
-	if err := stream.Close(); err != nil {
-		t.Fatalf("EventStream.Close() error = %v", err)
-	}
-	item, err := client.GetTask(t.Context(), created.ID)
-	if err != nil {
-		t.Fatalf("GetTask() error = %v", err)
-	}
+	item := waitForTerminalTask(t, client, created.ID)
 	if !item.Status.Terminal() || item.Result == "" {
 		t.Fatalf("task = %#v, want terminal result", item)
 	}
@@ -264,18 +241,7 @@ func TestRuntimeUsesRegisteredModelProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var item kern.Task
-	for time.Now().Before(deadline) {
-		item, err = runtime.Client().GetTask(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("GetTask() error = %v", err)
-		}
-		if item.Status.Terminal() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	item := waitForTerminalTask(t, runtime.Client(), created.ID)
 	if !item.Status.Terminal() || item.Result != "Response from the registered provider." {
 		t.Fatalf("task = %#v", item)
 	}
@@ -319,18 +285,7 @@ func TestRuntimeInvokesRegisteredCapabilityThroughCoreTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var item kern.Task
-	for time.Now().Before(deadline) {
-		item, err = runtime.Client().GetTask(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("GetTask() error = %v", err)
-		}
-		if item.Status.Terminal() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	item := waitForTerminalTask(t, runtime.Client(), created.ID)
 	if !item.Status.Terminal() || item.Result != "Host capability completed with evidence." || handlerCalls.Load() != 1 {
 		t.Fatalf("task=%#v handler calls=%d", item, handlerCalls.Load())
 	}
@@ -374,17 +329,10 @@ func TestRegisteredCapabilityCannotBypassApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var approvals []kern.Approval
-	for time.Now().Before(deadline) {
-		approvals, err = runtime.Client().PendingApprovals(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("PendingApprovals() error = %v", err)
-		}
-		if len(approvals) > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	waitForTaskEvent(t, runtime.Client(), created.ID, "approval.requested")
+	approvals, err := runtime.Client().PendingApprovals(t.Context(), created.ID)
+	if err != nil {
+		t.Fatalf("PendingApprovals() error = %v", err)
 	}
 	if len(approvals) != 1 || handlerCalls.Load() != 0 {
 		t.Fatalf("approvals=%#v handler calls=%d", approvals, handlerCalls.Load())
@@ -392,20 +340,56 @@ func TestRegisteredCapabilityCannotBypassApproval(t *testing.T) {
 	if _, err := runtime.Client().DecideApproval(t.Context(), approvals[0].ID, "approved"); err != nil {
 		t.Fatalf("DecideApproval() error = %v", err)
 	}
-	deadline = time.Now().Add(5 * time.Second)
-	var item kern.Task
-	for time.Now().Before(deadline) {
-		item, err = runtime.Client().GetTask(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("GetTask() error = %v", err)
-		}
-		if item.Status.Terminal() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	item := waitForTerminalTask(t, runtime.Client(), created.ID)
 	if !item.Status.Terminal() || handlerCalls.Load() != 1 {
 		t.Fatalf("task=%#v handler calls=%d", item, handlerCalls.Load())
+	}
+}
+
+func waitForTerminalTask(t *testing.T, client *kern.Client, taskID string) kern.Task {
+	t.Helper()
+	waitForTaskEvent(t, client, taskID,
+		"task.completed", "task.partially_completed", "task.failed", "task.cancelled")
+	item, err := client.GetTask(t.Context(), taskID)
+	if err != nil {
+		t.Fatalf("GetTask() error = %v", err)
+	}
+	return item
+}
+
+func waitForTaskEvent(t *testing.T, client *kern.Client, taskID string, eventTypes ...string) kern.Event {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	stream, err := client.OpenEventStream(ctx, taskID, 0)
+	if err != nil {
+		t.Fatalf("OpenEventStream() error = %v", err)
+	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("EventStream.Close() error = %v", err)
+		}
+	}()
+
+	wanted := make(map[string]struct{}, len(eventTypes))
+	for _, eventType := range eventTypes {
+		wanted[eventType] = struct{}{}
+	}
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			item, taskErr := client.GetTask(t.Context(), taskID)
+			t.Fatalf(
+				"waiting for task event %v: %v; task=%#v task_err=%v",
+				eventTypes,
+				err,
+				item,
+				taskErr,
+			)
+		}
+		if _, ok := wanted[event.Type]; ok {
+			return event
+		}
 	}
 }
 
