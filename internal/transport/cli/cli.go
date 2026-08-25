@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -577,6 +578,7 @@ func runWeb(
 	flags.SetOutput(stderr)
 	dataDir := flags.String("data-dir", defaults.Storage.DataDir, "local Kern data directory")
 	workspaceDir := flags.String("workspace", configuredWorkspace(defaults), "task workspace directory")
+	evalRoot := flags.String("eval-root", "", "trusted evaluation suite directory (optional)")
 	addr := flags.String("addr", defaults.Server.Address, "local listen address")
 	openPage := flags.Bool("open", true, "open Kern in the default browser")
 	budgets := bindBudgetFlags(flags, defaults.Runtime)
@@ -595,6 +597,15 @@ func runWeb(
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
 		return errors.New("web: first release only binds to a loopback address")
 	}
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return fmt.Errorf("web: opening loopback listener: %w", err)
+	}
+	defer listener.Close()
+	webURL, err := loopbackWebURL(listener)
+	if err != nil {
+		return err
+	}
 
 	budgetConfig.DataDir = *dataDir
 	budgetConfig.WorkspaceDir = *workspaceDir
@@ -609,10 +620,20 @@ func runWeb(
 		return err
 	}
 	defer runtime.Close()
+	workspaceRoot := runtime.Workspace.Root()
+	pluginImportRoot, err := os.OpenRoot(workspaceRoot)
+	if err != nil {
+		return fmt.Errorf("web: opening plugin import root: %w", err)
+	}
+	defer pluginImportRoot.Close()
 	evals, err := evalservice.New(ctx, evalservice.Config{
-		DataRoot: filepath.Join(*dataDir, "evals"),
-		Store:    runtime.Store, MaxActive: 1,
-		MaxTurns: budgetConfig.MaxTurns, MaxToolCalls: budgetConfig.MaxToolCalls,
+		DataRoot:       filepath.Join(*dataDir, "evals"),
+		EvalRoot:       strings.TrimSpace(*evalRoot),
+		WritableRoots:  []string{workspaceRoot},
+		Store:          runtime.Store,
+		PluginResolver: runtime.Plugins,
+		MaxActive:      1,
+		MaxTurns:       budgetConfig.MaxTurns, MaxToolCalls: budgetConfig.MaxToolCalls,
 		Logger: logger,
 	})
 	if err != nil {
@@ -624,45 +645,106 @@ func runWeb(
 		return err
 	}
 	handler, err := httpapi.New(httpapi.Config{
-		Store:          runtime.Store,
-		Artifacts:      runtime.Artifacts,
-		Submitter:      runtime,
-		Models:         runtime,
-		Plugins:        runtime.Plugins,
-		Evals:          evals,
-		MetricsEnabled: defaults.Observability.MetricsEnabled,
-		Token:          token,
-		Mode:           runtime.Mode,
-		Logger:         logger,
+		Store:                  runtime.Store,
+		Artifacts:              runtime.Artifacts,
+		Submitter:              runtime,
+		Models:                 runtime,
+		Plugins:                runtime.Plugins,
+		Evals:                  evals,
+		MetricsEnabled:         defaults.Observability.MetricsEnabled,
+		Token:                  token,
+		Mode:                   runtime.Mode,
+		Logger:                 logger,
+		PluginImportRoot:       pluginImportRoot,
+		Origin:                 webURL,
+		AllowPlainHTTPLoopback: true,
 	})
 	if err != nil {
 		return err
 	}
 	server := &http.Server{
-		Addr:              *addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 	}
-	url := "http://" + *addr
-	fmt.Fprintf(stderr, "Kern Web: %s (%s)\n", url, runtime.Mode)
+	fmt.Fprintf(stderr, "Kern Web: %s (%s)\n", webURL, runtime.Mode)
 	if *openPage {
-		go openBrowser(url, logger)
+		go openBrowser(webURL, logger)
 	}
+	return serveWebUntilCancelled(ctx, server, listener, handler, logger)
+}
+
+type shutdownResult struct {
+	triggered bool
+	err       error
+}
+
+func serveWebUntilCancelled(
+	ctx context.Context,
+	server *http.Server,
+	listener net.Listener,
+	handler *httpapi.Server,
+	logger *slog.Logger,
+) error {
+	watchStopped := make(chan struct{})
+	shutdownDone := make(chan shutdownResult, 1)
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("http shutdown failed", "error", err)
+		select {
+		case <-ctx.Done():
+			shutdownDone <- shutdownResult{triggered: true, err: stopWebServer(server, handler, logger)}
+		case <-watchStopped:
+			shutdownDone <- shutdownResult{}
 		}
 	}()
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serving web: %w", err)
+
+	serveErr := server.Serve(listener)
+	close(watchStopped)
+	result := <-shutdownDone
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		if result.triggered {
+			return result.err
+		}
+		return stopWebServer(server, handler, logger)
 	}
-	return nil
+
+	if !result.triggered {
+		result.err = stopWebServer(server, handler, logger)
+	}
+	return errors.Join(fmt.Errorf("serving web: %w", serveErr), result.err)
+}
+
+func stopWebServer(server *http.Server, handler *httpapi.Server, logger *slog.Logger) error {
+	handler.BeginShutdown()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownErr := server.Shutdown(shutdownCtx)
+	cancel()
+	if shutdownErr != nil {
+		logger.Warn("graceful HTTP shutdown did not finish; closing active connections", "error", shutdownErr)
+		shutdownErr = server.Close()
+	}
+	idleErr := handler.WaitForIdle(context.Background())
+	return errors.Join(shutdownErr, idleErr)
+}
+
+func loopbackWebURL(listener net.Listener) (string, error) {
+	if listener == nil || listener.Addr() == nil {
+		return "", errors.New("web: loopback listener is unavailable")
+	}
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		return "", fmt.Errorf("web: reading loopback listener address: %w", err)
+	}
+	address := net.ParseIP(host)
+	if address == nil || !address.IsLoopback() {
+		return "", errors.New("web: resolved listener address is not loopback")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", errors.New("web: resolved listener port is invalid")
+	}
+	return "http://" + net.JoinHostPort(address.String(), port), nil
 }
 
 func sessionToken() (string, error) {
@@ -792,7 +874,7 @@ func printUsage(w io.Writer) {
 Usage:
   kern run [--data-dir PATH] [--workspace PATH] [--output text|json] [budget flags] <goal>
   kern chat [--data-dir PATH] [--workspace PATH] [--output text|jsonl] [--once] [message]
-  kern web [--data-dir PATH] [--workspace PATH] [--addr 127.0.0.1:8787] [--open=true] [budget flags]
+  kern web [--data-dir PATH] [--workspace PATH] [--eval-root PATH] [--addr 127.0.0.1:8787] [--open=true] [budget flags]
   kern task list [--data-dir PATH] [--output text|json|jsonl]
   kern task show|pause|resume|cancel|retry [flags] TASK_ID
   kern plugin digest|list|inspect|install|enable|disable|remove

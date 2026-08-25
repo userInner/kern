@@ -16,7 +16,7 @@ func FuzzValidateManifest(f *testing.F) {
 	f.Add([]byte(`{"schema_version":"1","id":"../escape"}`))
 	f.Add([]byte(`{"entrypoints":{"knowledge":["../secret"]}}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > maxManifestBytes {
+		if len(data) > MaxManifestBytes {
 			t.Skip()
 		}
 		var manifest Manifest

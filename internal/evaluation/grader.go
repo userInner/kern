@@ -19,6 +19,7 @@ import (
 type GradeInput struct {
 	WorkspaceDir     string
 	BaselineDir      string
+	BaselineFiles    map[string]string
 	SafetyViolations int
 	Prompt           string
 	FinalOutput      string
@@ -56,7 +57,7 @@ func Grade(ctx context.Context, input GradeInput, graders []Grader) ([]GradeResu
 		case "json_schema":
 			result = gradeJSONSchema(ctx, root, grader)
 		case "patch_rule":
-			result = gradePatchRule(ctx, input.BaselineDir, input.WorkspaceDir, grader)
+			result = gradePatchRule(ctx, input.BaselineDir, input.BaselineFiles, input.WorkspaceDir, grader)
 		case "safety":
 			result = gradeSafety(input.SafetyViolations, grader)
 		case "human_review":

@@ -393,6 +393,169 @@ const eventTypes = [
   'plugin.signal_scan_failed',
 ]
 
+const browserTokenStorageKey = 'kern.browser-session.v1'
+let browserToken = ''
+
+function readBrowserToken(): string {
+  if (browserToken) return browserToken
+  if (typeof document === 'undefined') return ''
+  const bootstrap = document.querySelector<HTMLMetaElement>('meta[name="kern-session-token"]')
+  const injected = bootstrap?.content.trim() ?? ''
+  if (injected) {
+    browserToken = injected
+    bootstrap?.remove()
+    try {
+      window.sessionStorage.setItem(browserTokenStorageKey, injected)
+    } catch {
+      // Memory-only authentication remains available when storage is disabled.
+    }
+    return browserToken
+  }
+  try {
+    browserToken = window.sessionStorage.getItem(browserTokenStorageKey) ?? ''
+  } catch {
+    browserToken = ''
+  }
+  return browserToken
+}
+
+export function authorizedRequestInit(token: string, init: RequestInit = {}): RequestInit {
+  const headers = new Headers(init.headers)
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  return { ...init, credentials: 'omit', headers }
+}
+
+function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  return globalThis.fetch(input, authorizedRequestInit(readBrowserToken(), init))
+}
+
+export async function fetchAuthorizedDownload(
+  input: RequestInfo | URL,
+  token: string,
+  fetcher: typeof globalThis.fetch = globalThis.fetch,
+): Promise<Blob> {
+  const response = await fetcher(input, authorizedRequestInit(token))
+  if (!response.ok) throw new Error('文件下载失败')
+  return response.blob()
+}
+
+async function downloadResource(input: RequestInfo | URL, filename: string): Promise<void> {
+  const blob = await fetchAuthorizedDownload(input, readBrowserToken())
+  const objectURL = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = objectURL
+  link.download = filename
+  link.hidden = true
+  document.body.appendChild(link)
+  try {
+    link.click()
+  } finally {
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(objectURL), 0)
+  }
+}
+
+export type ParsedServerSentEvent = {
+  id: string
+  event: string
+  data: string
+}
+
+export function parseSSEFrames(input: string): {
+  events: ParsedServerSentEvent[]
+  remainder: string
+} {
+  const events: ParsedServerSentEvent[] = []
+  let remainder = input
+  while (true) {
+    const separator = /\r?\n\r?\n/.exec(remainder)
+    if (!separator || separator.index === undefined) break
+    const frame = remainder.slice(0, separator.index)
+    remainder = remainder.slice(separator.index + separator[0].length)
+    let id = ''
+    let event = 'message'
+    const data: string[] = []
+    for (const line of frame.split(/\r?\n/)) {
+      if (!line || line.startsWith(':')) continue
+      const colon = line.indexOf(':')
+      const field = colon < 0 ? line : line.slice(0, colon)
+      let value = colon < 0 ? '' : line.slice(colon + 1)
+      if (value.startsWith(' ')) value = value.slice(1)
+      if (field === 'id' && !value.includes('\0')) id = value
+      if (field === 'event') event = value
+      if (field === 'data') data.push(value)
+    }
+    if (data.length > 0) events.push({ id, event, data: data.join('\n') })
+  }
+  return { events, remainder }
+}
+
+async function consumeEventStream(
+  response: Response,
+  signal: AbortSignal,
+  onEvent: (event: ParsedServerSentEvent) => void,
+): Promise<void> {
+  if (!response.body) throw new Error('事件流不可用')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffered = ''
+  try {
+    while (!signal.aborted) {
+      const { done, value } = await reader.read()
+      buffered += decoder.decode(value, { stream: !done })
+      if (done) {
+        const parsed = parseSSEFrames(buffered + '\n\n')
+        parsed.events.forEach(onEvent)
+        return
+      }
+      const parsed = parseSSEFrames(buffered)
+      buffered = parsed.remainder
+      parsed.events.forEach(onEvent)
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+}
+
+function waitForReconnect(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const timer = window.setTimeout(resolve, 500)
+    signal.addEventListener('abort', () => {
+      window.clearTimeout(timer)
+      resolve()
+    }, { once: true })
+  })
+}
+
+async function streamTaskEvents(
+  taskID: string,
+  signal: AbortSignal,
+  cursor: () => number,
+  onEvent: (event: ParsedServerSentEvent) => void,
+): Promise<void> {
+  while (!signal.aborted) {
+    try {
+      const response = await apiFetch(`/api/v1/tasks/${encodeURIComponent(taskID)}/events`, {
+        headers: {
+          Accept: 'text/event-stream',
+          'Last-Event-ID': String(cursor()),
+        },
+        signal,
+      })
+      if (!response.ok) throw new Error('事件流连接失败')
+      await consumeEventStream(response, signal, onEvent)
+    } catch (cause) {
+      if (signal.aborted) return
+      if (cause instanceof DOMException && cause.name === 'AbortError') return
+    }
+    await waitForReconnect(signal)
+  }
+}
+
 type TaskAction = 'pause' | 'cancel' | 'resume' | 'retry'
 
 const actionLabels: Record<TaskAction, string> = {
@@ -454,7 +617,7 @@ function App() {
   const [selectedEvalID, setSelectedEvalID] = useState('')
   const [selectedEval, setSelectedEval] = useState<EvaluationRun | null>(null)
   const [evalReport, setEvalReport] = useState<EvaluationReport | null>(null)
-  const [evalSuitePath, setEvalSuitePath] = useState('./evals/go')
+  const [evalSuitePath, setEvalSuitePath] = useState('')
   const [evalVariants, setEvalVariants] = useState({ base: true, expert: true })
   const [startingEval, setStartingEval] = useState(false)
   const [evalAction, setEvalAction] = useState<'pause' | 'resume' | 'cancel' | ''>('')
@@ -469,7 +632,7 @@ function App() {
   const lastEventID = useRef(0)
 
   const loadTasks = useCallback(async () => {
-    const response = await fetch('/api/v1/tasks')
+    const response = await apiFetch('/api/v1/tasks')
     if (!response.ok) throw new Error('无法读取任务列表')
     const body = (await response.json()) as { tasks: Task[] }
     setTasks(body.tasks)
@@ -477,7 +640,7 @@ function App() {
   }, [])
 
   const loadModels = useCallback(async () => {
-    const response = await fetch('/api/v1/models')
+    const response = await apiFetch('/api/v1/models')
     if (!response.ok) throw new Error('无法读取模型设置')
     const body = (await response.json()) as { configs: ModelConfig[], credential_store_available: boolean }
     setModelConfigs(body.configs)
@@ -491,7 +654,7 @@ function App() {
   }, [])
 
   const loadSettings = useCallback(async () => {
-    const response = await fetch('/api/v1/settings')
+    const response = await apiFetch('/api/v1/settings')
     if (!response.ok) throw new Error(await responseError(response, '无法读取运行设置'))
     const body = (await response.json()) as RuntimeSettings
     setRuntimeSettings(body)
@@ -499,13 +662,13 @@ function App() {
   }, [])
 
   const loadCleanupPreview = useCallback(async () => {
-    const response = await fetch('/api/v1/settings/cleanup-preview')
+    const response = await apiFetch('/api/v1/settings/cleanup-preview')
     if (!response.ok) throw new Error(await responseError(response, '无法读取数据清理预览'))
     setCleanupPreview((await response.json()) as CleanupPreview)
   }, [])
 
   const loadPlugins = useCallback(async () => {
-    const response = await fetch('/api/v1/plugins')
+    const response = await apiFetch('/api/v1/plugins')
     if (!response.ok) throw new Error('无法读取插件列表')
     const body = (await response.json()) as { plugins: InstalledPlugin[] }
     setPlugins(body.plugins)
@@ -515,7 +678,7 @@ function App() {
   }, [])
 
   const loadEvalRuns = useCallback(async () => {
-    const response = await fetch('/api/v1/evals/runs?limit=50')
+    const response = await apiFetch('/api/v1/evals/runs?limit=50')
     if (!response.ok) throw new Error('无法读取评测记录')
     const body = (await response.json()) as { runs: EvaluationRun[] }
     setEvalRuns(body.runs)
@@ -523,12 +686,12 @@ function App() {
   }, [])
 
   const loadEval = useCallback(async (runID: string) => {
-    const response = await fetch(`/api/v1/evals/runs/${encodeURIComponent(runID)}`)
+    const response = await apiFetch(`/api/v1/evals/runs/${encodeURIComponent(runID)}`)
     if (!response.ok) throw new Error('无法读取评测状态')
     const run = (await response.json()) as EvaluationRun
     setSelectedEval(run)
     if (run.status === 'completed') {
-      const reportResponse = await fetch(`/api/v1/evals/runs/${encodeURIComponent(runID)}/report`)
+      const reportResponse = await apiFetch(`/api/v1/evals/runs/${encodeURIComponent(runID)}/report`)
       if (!reportResponse.ok) throw new Error('无法读取评测报告')
       setEvalReport((await reportResponse.json()) as EvaluationReport)
     } else {
@@ -537,26 +700,26 @@ function App() {
   }, [])
 
   const loadTask = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}`)
     if (!response.ok) throw new Error('无法读取任务')
     setSelected((await response.json()) as Task)
   }, [])
 
   const loadApprovals = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}/approvals`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}/approvals`)
     if (!response.ok) throw new Error('无法读取授权请求')
     const body = (await response.json()) as { approvals: ApprovalRequest[] }
     setApprovals(body.approvals)
   }, [])
 
   const loadArtifacts = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}/artifacts`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}/artifacts`)
     if (!response.ok) throw new Error('无法读取任务产物')
     const body = (await response.json()) as { artifacts: Artifact[] }
     setArtifacts(body.artifacts)
 		const diffArtifacts = body.artifacts.filter((item) => item.media_type === 'text/x-diff')
 		const loadedDiffs = await Promise.all(diffArtifacts.map(async (item) => {
-			const contentResponse = await fetch(`/api/v1/tasks/${taskID}/artifacts/${item.id}`)
+			const contentResponse = await apiFetch(`/api/v1/tasks/${taskID}/artifacts/${item.id}`)
 			if (!contentResponse.ok) throw new Error(`无法读取差异产物 ${item.name}`)
 			return [item.id, await contentResponse.text()] as const
 		}))
@@ -564,28 +727,28 @@ function App() {
   }, [])
 
   const loadUncertainOperations = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}/operations/uncertain`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}/operations/uncertain`)
     if (!response.ok) throw new Error('无法读取待确认的中断操作')
     const body = (await response.json()) as { operations: UncertainOperation[] }
     setUncertainOperations(body.operations)
   }, [])
 
   const loadCurrentPlan = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}/plan`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}/plan`)
     if (!response.ok) throw new Error('无法读取任务计划')
     const body = (await response.json()) as { plan: ExecutionPlan | null }
     setCurrentPlan(body.plan)
   }, [])
 
   const loadVerifications = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}/verifications`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}/verifications`)
     if (!response.ok) throw new Error('无法读取验证报告')
     const body = (await response.json()) as { verifications: VerificationRecord[] }
     setVerifications(body.verifications)
   }, [])
 
   const loadTaskPlugins = useCallback(async (taskID: string) => {
-    const response = await fetch(`/api/v1/tasks/${taskID}/plugins`)
+    const response = await apiFetch(`/api/v1/tasks/${taskID}/plugins`)
     if (!response.ok) throw new Error('无法读取任务插件证据')
     const body = (await response.json()) as { plugins: PluginUsage[] }
     setTaskPlugins(body.plugins)
@@ -593,7 +756,7 @@ function App() {
 
   useEffect(() => {
     Promise.all([
-      fetch('/api/v1/health').then((response) => response.json() as Promise<Health>),
+      apiFetch('/api/v1/health').then((response) => response.json() as Promise<Health>),
       loadTasks(),
       loadModels(),
       loadSettings(),
@@ -654,7 +817,7 @@ function App() {
     ])
       .catch((cause: Error) => setError(cause.message))
 
-    const stream = new EventSource(`/api/v1/tasks/${selectedID}/events`)
+    const streamController = new AbortController()
     let refreshTimer: number | undefined
     const scheduleSnapshotRefresh = () => {
       window.clearTimeout(refreshTimer)
@@ -669,20 +832,18 @@ function App() {
         loadTasks().catch(() => undefined)
       }, 80)
     }
-    const onEvent = (raw: MessageEvent<string>) => {
+    const onEvent = (raw: ParsedServerSentEvent) => {
+      if (!eventTypes.includes(raw.event)) return
       const event = JSON.parse(raw.data) as TaskEvent
       if (event.id <= lastEventID.current) return
       lastEventID.current = event.id
       setEvents((current) => [...current, event])
       scheduleSnapshotRefresh()
     }
-    eventTypes.forEach((type) => stream.addEventListener(type, onEvent as EventListener))
-    stream.onerror = () => {
-      // EventSource reconnects automatically and the server replays from the cursor.
-    }
+    void streamTaskEvents(selectedID, streamController.signal, () => lastEventID.current, onEvent)
     return () => {
       window.clearTimeout(refreshTimer)
-      stream.close()
+      streamController.abort()
     }
   }, [loadApprovals, loadArtifacts, loadCurrentPlan, loadTask, loadTaskPlugins, loadTasks, loadUncertainOperations, loadVerifications, selectedID])
 
@@ -703,7 +864,7 @@ function App() {
       )
       const shouldContinue = taskSubmissionMode(canContinue, submitter?.dataset.mode) === 'continue'
       const encodedAttachments = await Promise.all(attachments.map(fileToTaskAttachment))
-      const response = await fetch(
+      const response = await apiFetch(
         shouldContinue ? `/api/v1/tasks/${selected!.id}/messages` : '/api/v1/tasks',
         {
         method: 'POST',
@@ -767,7 +928,7 @@ function App() {
     setError('')
     setSavingModel(true)
     try {
-      const response = await fetch('/api/v1/model-configs', {
+      const response = await apiFetch('/api/v1/model-configs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -798,7 +959,7 @@ function App() {
 
   async function makeDefaultModel(config: ModelConfig) {
     setError('')
-    const response = await fetch(`/api/v1/model-configs/${config.id}`, {
+    const response = await apiFetch(`/api/v1/model-configs/${config.id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -824,7 +985,7 @@ function App() {
     setError('')
     setDeletingModelID(config.id)
     try {
-      const response = await fetch(`/api/v1/model-configs/${config.id}`, { method: 'DELETE' })
+      const response = await apiFetch(`/api/v1/model-configs/${config.id}`, { method: 'DELETE' })
       if (!response.ok) throw new Error('模型连接删除失败')
       await loadModels()
     } catch (cause) {
@@ -840,7 +1001,7 @@ function App() {
     setTestingModelID(config.id)
     setModelTestResults((current) => ({ ...current, [config.id]: '' }))
     try {
-      const response = await fetch(`/api/v1/model-configs/${config.id}/test`, { method: 'POST' })
+      const response = await apiFetch(`/api/v1/model-configs/${config.id}/test`, { method: 'POST' })
       if (!response.ok) throw new Error('连接检测失败，请检查地址、模型和密钥环境变量')
       const result = (await response.json()) as { latency_ms: number }
       setModelTestResults((current) => ({ ...current, [config.id]: `连接正常 · ${result.latency_ms} ms` }))
@@ -859,7 +1020,7 @@ function App() {
     setSettingsNotice('')
     setSavingSettings(true)
     try {
-      const response = await fetch('/api/v1/settings', {
+      const response = await apiFetch('/api/v1/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -896,7 +1057,7 @@ function App() {
     setSettingsNotice('')
     setCleaningData(true)
     try {
-      const response = await fetch('/api/v1/settings/cleanup', {
+      const response = await apiFetch('/api/v1/settings/cleanup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
@@ -919,7 +1080,7 @@ function App() {
     setError('')
     setInstallingPlugin(true)
     try {
-      const response = await fetch('/api/v1/plugins/install', {
+      const response = await apiFetch('/api/v1/plugins/install', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source, enable: enableInstalledPlugin }),
@@ -939,7 +1100,7 @@ function App() {
     setError('')
     setMutatingPluginID(item.id)
     try {
-      const response = await fetch(`/api/v1/plugins/${encodeURIComponent(item.id)}/${enabled ? 'enable' : 'disable'}`, {
+      const response = await apiFetch(`/api/v1/plugins/${encodeURIComponent(item.id)}/${enabled ? 'enable' : 'disable'}`, {
         method: 'POST',
       })
       if (!response.ok) throw new Error(await responseError(response, enabled ? '插件启用失败' : '插件停用失败'))
@@ -956,7 +1117,7 @@ function App() {
     setError('')
     setMutatingPluginID(item.id)
     try {
-      const response = await fetch(`/api/v1/plugins/${encodeURIComponent(item.id)}`, { method: 'DELETE' })
+      const response = await apiFetch(`/api/v1/plugins/${encodeURIComponent(item.id)}`, { method: 'DELETE' })
       if (!response.ok) throw new Error(await responseError(response, '插件卸载失败'))
       await loadPlugins()
     } catch (cause) {
@@ -976,7 +1137,7 @@ function App() {
     setError('')
     setStartingEval(true)
     try {
-      const response = await fetch('/api/v1/evals/runs', {
+      const response = await apiFetch('/api/v1/evals/runs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ suite_path: evalSuitePath.trim(), variants }),
@@ -1002,7 +1163,7 @@ function App() {
     setError('')
     setEvalAction(action)
     try {
-      const response = await fetch(`/api/v1/evals/runs/${encodeURIComponent(selectedEval.id)}/${action}`, { method: 'POST' })
+      const response = await apiFetch(`/api/v1/evals/runs/${encodeURIComponent(selectedEval.id)}/${action}`, { method: 'POST' })
       const fallback = action === 'pause' ? '评测暂停失败' : action === 'resume' ? '评测继续失败' : '评测取消失败'
       if (!response.ok) throw new Error(await responseError(response, fallback))
       await Promise.all([loadEvalRuns(), loadEval(selectedEval.id)])
@@ -1018,7 +1179,7 @@ function App() {
     setError('')
     setActiveAction(action)
     try {
-      const response = await fetch(`/api/v1/tasks/${selected.id}/${action}`, { method: 'POST' })
+      const response = await apiFetch(`/api/v1/tasks/${selected.id}/${action}`, { method: 'POST' })
       if (!response.ok) {
         const body = (await response.json().catch(() => null)) as { detail?: string } | null
         throw new Error(body?.detail || `${actionLabels[action]}任务失败`)
@@ -1038,7 +1199,7 @@ function App() {
     setError('')
     setActiveApproval(requestID)
     try {
-      const response = await fetch(`/api/v1/approvals/${requestID}/decision`, {
+      const response = await apiFetch(`/api/v1/approvals/${requestID}/decision`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ decision }),
@@ -1060,7 +1221,7 @@ function App() {
     setError('')
     setActiveResolution(operationID)
     try {
-      const response = await fetch(`/api/v1/operations/${operationID}/resolution`, {
+      const response = await apiFetch(`/api/v1/operations/${operationID}/resolution`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resolution }),
@@ -1361,10 +1522,16 @@ function App() {
                   <div className="artifact-list">
                     {artifacts.map((item) => (
                       <div className="artifact-item" key={item.id}>
-                        <a
+                        <button
+                          type="button"
                           className="artifact-row"
-                          href={`/api/v1/tasks/${selected.id}/artifacts/${item.id}`}
-                          download={item.name}
+                          onClick={() => {
+                            setError('')
+                            void downloadResource(
+                              `/api/v1/tasks/${encodeURIComponent(selected.id)}/artifacts/${encodeURIComponent(item.id)}`,
+                              item.name,
+                            ).catch((cause: Error) => setError(cause.message))
+                          }}
                         >
                           <span className="artifact-icon">↓</span>
                           <span className="artifact-copy">
@@ -1372,7 +1539,7 @@ function App() {
                             <small>{item.media_type} · {formatBytes(item.size)}</small>
                           </span>
                           <code>{item.digest.slice(0, 10)}</code>
-                        </a>
+                        </button>
                         {item.media_type === 'text/x-diff' && artifactDiffs[item.id] && (
                           <details className="diff-card" open>
                             <summary>查看修改差异</summary>
@@ -1547,12 +1714,12 @@ function App() {
                 <b>ISOLATED WORKSPACES</b>
               </div>
               <label className="eval-suite-path">
-                Suite 路径
+                可信评测目录内的 Suite 路径
                 <input
                   required
                   value={evalSuitePath}
                   onChange={(event) => setEvalSuitePath(event.target.value)}
-                  placeholder="./evals/go"
+                  placeholder="go"
                 />
               </label>
               <fieldset>
@@ -1563,7 +1730,7 @@ function App() {
               <button type="submit" disabled={startingEval || !evalSuitePath.trim() || (!evalVariants.base && !evalVariants.expert)}>
                 {startingEval ? '校验并入队中…' : '开始评测'}
               </button>
-              <small>Suite 会先做严格 Schema、路径、插件版本与命令允许列表检查；每个 Case/Variant/Attempt 都从干净夹具开始。</small>
+              <small>路径相对于启动时通过 --eval-root 配置的可信目录；该目录必须与 Agent 可写工作区隔离。Suite 会先做严格 Schema、路径、插件版本与命令允许列表检查，每个 Case/Variant/Attempt 都从干净夹具开始。</small>
             </form>
             <div className="eval-workbench">
               <section className="eval-run-list" aria-label="评测运行记录">
@@ -1669,9 +1836,19 @@ function App() {
                             </div>
                           ))}
                         </div>
-                        <a className="download-report" href={`/api/v1/evals/runs/${encodeURIComponent(selectedEval.id)}/report`} download>
+                        <button
+                          type="button"
+                          className="download-report"
+                          onClick={() => {
+                            setError('')
+                            void downloadResource(
+                              `/api/v1/evals/runs/${encodeURIComponent(selectedEval.id)}/report`,
+                              `kern-eval-${selectedEval.id}.json`,
+                            ).catch((cause: Error) => setError(cause.message))
+                          }}
+                        >
                           导出完整 JSON 报告 ↗
-                        </a>
+                        </button>
                       </>
                     )}
                   </>
@@ -1887,12 +2064,12 @@ function App() {
                 <b>VERIFY BEFORE COPY</b>
               </div>
               <label>
-                插件目录
+                工作区内插件目录
                 <input
                   required
                   value={pluginSource}
                   onChange={(event) => setPluginSource(event.target.value)}
-                  placeholder="/absolute/path/to/plugin"
+                  placeholder="plugins/go-expert"
                 />
               </label>
               <label className="install-enable-check">
@@ -1906,7 +2083,7 @@ function App() {
               <button type="submit" disabled={installingPlugin || !pluginSource.trim()}>
                 {installingPlugin ? '校验并安装中…' : '校验并安装'}
               </button>
-              <small>安装前会验证 Manifest、Core 兼容范围、文件摘要、路径与权限声明。</small>
+              <small>目录必须位于当前工作区内；安装前会验证 Manifest、Core 兼容范围、文件摘要、路径与权限声明。</small>
             </form>
           </section>
         </div>

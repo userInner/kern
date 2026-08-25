@@ -4,20 +4,28 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/userInner/kern/internal/app"
@@ -30,6 +38,7 @@ import (
 	"github.com/userInner/kern/internal/operation"
 	"github.com/userInner/kern/internal/plan"
 	"github.com/userInner/kern/internal/plugin"
+	"github.com/userInner/kern/internal/pluginmanager"
 	"github.com/userInner/kern/internal/secret"
 	"github.com/userInner/kern/internal/task"
 	"github.com/userInner/kern/internal/tracecontext"
@@ -38,7 +47,8 @@ import (
 const (
 	maxRequestBytes     = 1 << 20
 	maxTaskRequestBytes = 18 << 20
-	sessionCookie       = "kern_session"
+	browserSessionTTL   = 24 * time.Hour
+	browserSessionV1    = byte(1)
 )
 
 //go:embed web/*
@@ -140,7 +150,7 @@ type modelConfigTester interface {
 }
 
 type pluginManager interface {
-	Install(ctx context.Context, source string) (plugin.Installed, bool, error)
+	InstallFromRoot(ctx context.Context, root *os.Root, source string) (plugin.Installed, bool, error)
 	Get(ctx context.Context, pluginID string) (plugin.Installed, error)
 	List(ctx context.Context) ([]plugin.Installed, error)
 	Enable(ctx context.Context, pluginID string) (plugin.Installed, error)
@@ -183,23 +193,46 @@ type Config struct {
 	Token          string
 	Mode           string
 	Logger         *slog.Logger
+	// PluginImportRoot confines browser-selected plugin sources to one trusted
+	// directory opened by the composition root at process startup.
+	PluginImportRoot *os.Root
+	// Origin is the one browser origin this handler serves. Requests with any
+	// other Host are rejected before routing or bootstrap-token issuance.
+	Origin string
+	// AllowPlainHTTPLoopback explicitly opts into serving the browser over
+	// unencrypted HTTP. It is accepted only for a loopback origin; HTTPS must
+	// leave it disabled.
+	AllowPlainHTTPLoopback bool
 }
 
 // Server is Kern's local HTTP handler.
 type Server struct {
-	store          taskReader
-	artifacts      artifactReader
-	submitter      taskSubmitter
-	models         modelConfigStore
-	plugins        pluginManager
-	evals          evaluationManager
-	metrics        metricsReader
-	settings       settingsManager
-	metricsEnabled bool
-	token          string
-	mode           string
-	logger         *slog.Logger
-	handler        http.Handler
+	store            taskReader
+	artifacts        artifactReader
+	submitter        taskSubmitter
+	models           modelConfigStore
+	plugins          pluginManager
+	evals            evaluationManager
+	metrics          metricsReader
+	settings         settingsManager
+	metricsEnabled   bool
+	token            string
+	mode             string
+	logger           *slog.Logger
+	pluginImportRoot *os.Root
+	origin           string
+	originScheme     string
+	authority        string
+	secureTransport  bool
+	browserTokenKey  [sha256.Size]byte
+	handler          http.Handler
+	requestsMu       sync.Mutex
+	closing          bool
+	inFlight         int
+	idle             chan struct{}
+	shutdownCtx      context.Context
+	shutdownCancel   context.CancelFunc
+	shutdownOnce     sync.Once
 }
 
 // New constructs the HTTP API and embedded Web handler.
@@ -209,6 +242,13 @@ func New(config Config) (*Server, error) {
 	}
 	if config.Token == "" {
 		return nil, errors.New("httpapi: session token is required")
+	}
+	if config.Plugins != nil && config.PluginImportRoot == nil {
+		return nil, errors.New("httpapi: plugin import root is required when plugin management is enabled")
+	}
+	origin, err := newOriginPolicy(config.Origin, config.AllowPlainHTTPLoopback)
+	if err != nil {
+		return nil, err
 	}
 	logger := config.Logger
 	if logger == nil {
@@ -229,27 +269,183 @@ func New(config Config) (*Server, error) {
 	if settings == nil {
 		settings, _ = config.Submitter.(settingsManager)
 	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	server := &Server{
-		store:          config.Store,
-		artifacts:      config.Artifacts,
-		submitter:      config.Submitter,
-		models:         models,
-		plugins:        config.Plugins,
-		evals:          config.Evals,
-		metrics:        metrics,
-		settings:       settings,
-		metricsEnabled: config.MetricsEnabled,
-		token:          config.Token,
-		mode:           config.Mode,
-		logger:         logger,
+		store:            config.Store,
+		artifacts:        config.Artifacts,
+		submitter:        config.Submitter,
+		models:           models,
+		plugins:          config.Plugins,
+		evals:            config.Evals,
+		metrics:          metrics,
+		settings:         settings,
+		metricsEnabled:   config.MetricsEnabled,
+		token:            config.Token,
+		mode:             config.Mode,
+		logger:           logger,
+		pluginImportRoot: config.PluginImportRoot,
+		origin:           origin.value,
+		originScheme:     origin.scheme,
+		authority:        origin.authority,
+		secureTransport:  origin.secureTransport,
+		browserTokenKey:  sha256.Sum256([]byte("kern/browser-session/v1\x00" + config.Token)),
+		idle:             closedSignal(),
+		shutdownCtx:      shutdownCtx,
+		shutdownCancel:   shutdownCancel,
 	}
 	server.handler = server.routes()
 	return server, nil
 }
 
+type originPolicy struct {
+	value           string
+	scheme          string
+	authority       string
+	secureTransport bool
+}
+
+func newOriginPolicy(raw string, allowPlainHTTPLoopback bool) (originPolicy, error) {
+	value := strings.TrimSpace(raw)
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return originPolicy{}, fmt.Errorf("httpapi: parsing browser origin: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return originPolicy{}, errors.New("httpapi: browser origin must use http or https")
+	}
+	if parsed.User != nil || parsed.Opaque != "" || parsed.Host == "" ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return originPolicy{}, errors.New("httpapi: browser origin must contain only scheme and authority")
+	}
+	authority, hostname, err := canonicalAuthority(scheme, parsed.Host)
+	if err != nil {
+		return originPolicy{}, err
+	}
+	loopback := strings.EqualFold(hostname, "localhost")
+	if address := net.ParseIP(hostname); address != nil {
+		loopback = address.IsLoopback()
+	}
+	if !loopback {
+		return originPolicy{}, errors.New("httpapi: browser origin must be loopback")
+	}
+	if scheme == "http" {
+		if !allowPlainHTTPLoopback {
+			return originPolicy{}, errors.New("httpapi: plain HTTP requires an explicit loopback transport exception")
+		}
+	} else if allowPlainHTTPLoopback {
+		return originPolicy{}, errors.New("httpapi: insecure loopback transport exception is invalid for HTTPS")
+	}
+	return originPolicy{
+		value:           scheme + "://" + authority,
+		scheme:          scheme,
+		authority:       authority,
+		secureTransport: scheme == "https",
+	}, nil
+}
+
+func canonicalAuthority(scheme, raw string) (string, string, error) {
+	parsed, err := url.Parse(scheme + "://" + raw)
+	if err != nil || parsed.User != nil || parsed.Host == "" || parsed.Path != "" ||
+		parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "", errors.New("httpapi: browser origin authority is invalid")
+	}
+	hostname := strings.ToLower(parsed.Hostname())
+	if hostname == "" || strings.HasSuffix(hostname, ".") {
+		return "", "", errors.New("httpapi: browser origin host is invalid")
+	}
+	port := parsed.Port()
+	if port != "" {
+		portNumber, parseErr := strconv.Atoi(port)
+		if parseErr != nil || portNumber < 1 || portNumber > 65535 || strconv.Itoa(portNumber) != port {
+			return "", "", errors.New("httpapi: browser origin port is invalid")
+		}
+	}
+	inputAuthority := formatAuthority(hostname, port)
+	if !strings.EqualFold(parsed.Host, inputAuthority) {
+		return "", "", errors.New("httpapi: browser origin authority is not canonical")
+	}
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	authority := formatAuthority(hostname, port)
+	return authority, hostname, nil
+}
+
+func formatAuthority(hostname, port string) string {
+	if port != "" {
+		return net.JoinHostPort(hostname, port)
+	}
+	if strings.Contains(hostname, ":") {
+		return "[" + hostname + "]"
+	}
+	return hostname
+}
+
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.handler.ServeHTTP(w, r)
+	if !s.beginRequest() {
+		writeProblem(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+	defer s.endRequest()
+	requestCtx, cancel := context.WithCancel(r.Context())
+	stopShutdownCancellation := context.AfterFunc(s.shutdownCtx, cancel)
+	defer stopShutdownCancellation()
+	defer cancel()
+	s.handler.ServeHTTP(w, r.WithContext(requestCtx))
+}
+
+// BeginShutdown prevents new requests from entering the handler and cancels
+// every admitted request context before the owning http.Server drains them.
+func (s *Server) BeginShutdown() {
+	s.requestsMu.Lock()
+	s.closing = true
+	s.requestsMu.Unlock()
+	s.shutdownOnce.Do(s.shutdownCancel)
+}
+
+// WaitForIdle waits until every request admitted before shutdown has left the
+// handler. Call BeginShutdown before WaitForIdle to prevent new admissions.
+func (s *Server) WaitForIdle(ctx context.Context) error {
+	s.requestsMu.Lock()
+	idle := s.idle
+	s.requestsMu.Unlock()
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) beginRequest() bool {
+	s.requestsMu.Lock()
+	defer s.requestsMu.Unlock()
+	if s.closing {
+		return false
+	}
+	if s.inFlight == 0 {
+		s.idle = make(chan struct{})
+	}
+	s.inFlight++
+	return true
+}
+
+func (s *Server) endRequest() {
+	s.requestsMu.Lock()
+	defer s.requestsMu.Unlock()
+	s.inFlight--
+	if s.inFlight == 0 {
+		close(s.idle)
+	}
+}
+
+func closedSignal() chan struct{} {
+	closed := make(chan struct{})
+	close(closed)
+	return closed
 }
 
 func (s *Server) routes() http.Handler {
@@ -258,7 +454,7 @@ func (s *Server) routes() http.Handler {
 		mux.Handle(route.method+" "+route.path, route.handler)
 	}
 	mux.Handle("/", s.handleWeb())
-	return s.securityHeaders(s.requestTrace(s.requestLog(mux)))
+	return s.securityHeaders(s.requireConfiguredHost(s.requestTrace(s.requestLog(mux))))
 }
 
 type apiRoute struct {
@@ -1249,10 +1445,10 @@ func (s *Server) handleInstallPlugin(w http.ResponseWriter, r *http.Request) {
 	}
 	input.Source = strings.TrimSpace(input.Source)
 	if input.Source == "" || len(input.Source) > 4_096 {
-		writeProblem(w, http.StatusBadRequest, "source must be a local directory path")
+		writeProblem(w, http.StatusBadRequest, "source must be a workspace-relative plugin directory")
 		return
 	}
-	item, created, err := s.plugins.Install(r.Context(), input.Source)
+	item, created, err := s.plugins.InstallFromRoot(r.Context(), s.pluginImportRoot, input.Source)
 	if err != nil {
 		s.writePluginError(w, r, err)
 		return
@@ -1324,6 +1520,8 @@ func (s *Server) writePluginError(w http.ResponseWriter, r *http.Request, err er
 		writeProblem(w, http.StatusNotFound, "plugin not found")
 	case errors.Is(err, plugin.ErrConflict):
 		writeProblem(w, http.StatusConflict, "another plugin version is already installed")
+	case errors.Is(err, pluginmanager.ErrInvalidSource):
+		writeProblem(w, http.StatusBadRequest, "plugin source must be a valid workspace-relative directory")
 	case errors.Is(err, plugin.ErrInvalidManifest), errors.Is(err, plugin.ErrIncompatible),
 		errors.Is(err, plugin.ErrIntegrity):
 		writeProblem(w, http.StatusBadRequest, err.Error())
@@ -1413,13 +1611,9 @@ func (s *Server) writeModelConfigError(w http.ResponseWriter, r *http.Request, e
 		writeProblem(w, http.StatusNotFound, "model config not found")
 	case errors.Is(err, modelconfig.ErrConflict):
 		writeProblem(w, http.StatusConflict, "model config name already exists")
+	case errors.Is(err, modelconfig.ErrDisabled):
+		writeProblem(w, http.StatusConflict, "model config is disabled")
 	default:
-		var urlError *url.Error
-		if errors.As(err, &urlError) || strings.HasPrefix(err.Error(), "modelconfig:") ||
-			strings.HasPrefix(err.Error(), "secret:") {
-			writeProblem(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		s.internalError(w, r, err)
 	}
 }
@@ -1484,6 +1678,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 
 		select {
+		case <-s.shutdownCtx.Done():
+			return
 		case <-r.Context().Done():
 			return
 		case <-poll.C:
@@ -1499,12 +1695,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if provided == "" {
-			if cookie, err := r.Cookie(sessionCookie); err == nil {
-				provided = cookie.Value
-			}
-		}
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+		staticTokenValid := subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1
+		if !staticTokenValid && !s.validBrowserToken(provided, time.Now()) {
 			writeProblem(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
@@ -1512,15 +1704,48 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) validMutationOrigin(r *http.Request) bool {
-	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-		return true
-	}
-	origin := r.Header.Get("Origin")
-	if origin == "" {
+func (s *Server) requireConfiguredHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.secureTransport != (r.TLS != nil) {
+			writeProblem(w, http.StatusMisdirectedRequest, "request transport is not allowed")
+			return
+		}
+		authority, _, err := canonicalAuthority(s.originScheme, r.Host)
+		if err != nil || authority != s.authority {
+			writeProblem(w, http.StatusMisdirectedRequest, "request host is not allowed")
+			return
+		}
+		if !isLoopbackPeer(r.RemoteAddr) {
+			writeProblem(w, http.StatusMisdirectedRequest, "request peer is not loopback")
+			return
+		}
+		if r.URL.IsAbs() {
+			absoluteAuthority, _, absoluteErr := canonicalAuthority(strings.ToLower(r.URL.Scheme), r.URL.Host)
+			if absoluteErr != nil || strings.ToLower(r.URL.Scheme) != s.originScheme ||
+				absoluteAuthority != s.authority {
+				writeProblem(w, http.StatusMisdirectedRequest, "request target is not allowed")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLoopbackPeer(remoteAddress string) bool {
+	host, _, err := net.SplitHostPort(remoteAddress)
+	if err != nil {
 		return false
 	}
-	return origin == "http://"+r.Host || origin == "https://"+r.Host
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
+}
+
+func (s *Server) validMutationOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	return origin == s.origin
 }
 
 func (s *Server) requireMutationOrigin(next http.Handler) http.Handler {
@@ -1538,22 +1763,81 @@ func (s *Server) handleWeb() http.Handler {
 	if err != nil {
 		panic(err)
 	}
+	index, err := fs.ReadFile(assets, "index.html")
+	if err != nil {
+		panic(err)
+	}
 	files := http.FileServer(http.FS(assets))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookie,
-			Value:    s.token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				writeProblem(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			token, tokenErr := s.issueBrowserToken(time.Now())
+			if tokenErr != nil {
+				s.internalError(w, r, tokenErr)
+				return
+			}
+			const head = "</head>"
+			injection := []byte(`<meta name="kern-session-token" content="` + html.EscapeString(token) + `">`)
+			page := bytes.Replace(index, []byte(head), append(injection, []byte(head)...), 1)
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Content-Length", strconv.Itoa(len(page)))
+			w.WriteHeader(http.StatusOK)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(page)
+			}
+			return
+		}
 		files.ServeHTTP(w, r)
 	})
 }
 
+func (s *Server) issueBrowserToken(now time.Time) (string, error) {
+	payload := make([]byte, 1+8+16)
+	payload[0] = browserSessionV1
+	binary.BigEndian.PutUint64(payload[1:9], uint64(now.Add(browserSessionTTL).Unix()))
+	if _, err := rand.Read(payload[9:]); err != nil {
+		return "", fmt.Errorf("httpapi: generating browser session token: %w", err)
+	}
+	mac := hmac.New(sha256.New, s.browserTokenKey[:])
+	_, _ = mac.Write(payload)
+	return "ks1." + base64.RawURLEncoding.EncodeToString(payload) + "." +
+		base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func (s *Server) validBrowserToken(token string, now time.Time) bool {
+	prefix, encoded, ok := strings.Cut(token, ".")
+	if !ok || prefix != "ks1" {
+		return false
+	}
+	encodedPayload, encodedMAC, ok := strings.Cut(encoded, ".")
+	if !ok || strings.Contains(encodedMAC, ".") {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(encodedPayload)
+	if err != nil || len(payload) != 1+8+16 || payload[0] != browserSessionV1 {
+		return false
+	}
+	providedMAC, err := base64.RawURLEncoding.DecodeString(encodedMAC)
+	if err != nil || len(providedMAC) != sha256.Size {
+		return false
+	}
+	mac := hmac.New(sha256.New, s.browserTokenKey[:])
+	_, _ = mac.Write(payload)
+	if !hmac.Equal(providedMAC, mac.Sum(nil)) {
+		return false
+	}
+	expiresAt := int64(binary.BigEndian.Uint64(payload[1:9]))
+	return expiresAt >= now.Unix() && expiresAt <= now.Add(browserSessionTTL).Unix()
+}
+
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -1586,12 +1870,12 @@ func (s *Server) requestTrace(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error) {
+func (s *Server) internalError(w http.ResponseWriter, r *http.Request, _ error) {
 	identity, _ := tracecontext.From(r.Context())
 	s.logger.ErrorContext(
 		r.Context(),
 		"http request failed",
-		"error", err,
+		"error_kind", "internal",
 		"trace_id", identity.TraceID,
 		"span_id", identity.SpanID,
 	)

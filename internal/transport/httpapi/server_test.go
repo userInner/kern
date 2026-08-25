@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -31,6 +30,55 @@ import (
 	"github.com/userInner/kern/internal/task"
 )
 
+func newLoopbackTestServer(t *testing.T, config Config) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewUnstartedServer(nil)
+	config.Origin = "http://" + server.Listener.Addr().String()
+	config.AllowPlainHTTPLoopback = true
+	handler, err := New(config)
+	if err != nil {
+		server.Close()
+		t.Fatalf("New() error = %v", err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newDirectTestHandler(t *testing.T, config Config) http.Handler {
+	t.Helper()
+	config.Origin = "http://127.0.0.1:8787"
+	config.AllowPlainHTTPLoopback = true
+	handler, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = "127.0.0.1:8787"
+		r.RemoteAddr = "127.0.0.1:50000"
+		handler.ServeHTTP(w, r)
+	})
+}
+
+type bearerTransport struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (t bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header.Set("Authorization", "Bearer "+t.token)
+	return t.base.RoundTrip(clone)
+}
+
+func authenticatedTestClient(server *httptest.Server, token string) *http.Client {
+	client := server.Client()
+	client.Transport = bearerTransport{base: client.Transport, token: token}
+	return client
+}
+
 func TestServerTaskAndSSEFlow(t *testing.T) {
 	t.Setenv("KERN_MODEL_BASE_URL", "")
 	t.Setenv("KERN_MODEL", "")
@@ -44,7 +92,7 @@ func TestServerTaskAndSSEFlow(t *testing.T) {
 		t.Fatalf("app.Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	handler, err := New(Config{
+	server := newLoopbackTestServer(t, Config{
 		Store:          runtime.Store,
 		Artifacts:      runtime.Artifacts,
 		Submitter:      runtime,
@@ -53,17 +101,7 @@ func TestServerTaskAndSSEFlow(t *testing.T) {
 		Mode:           runtime.Mode,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	server := httptest.NewServer(handler)
-	defer server.Close()
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar.New() error = %v", err)
-	}
-	client := server.Client()
-	client.Jar = jar
+	client := authenticatedTestClient(server, "test-token")
 
 	response, err := client.Get(server.URL + "/")
 	if err != nil {
@@ -219,17 +257,11 @@ func TestMetricsRequireAuthenticationAndRespectConfiguration(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
 	newServer := func(enabled bool) *httptest.Server {
-		handler, err := New(Config{
+		return newLoopbackTestServer(t, Config{
 			Store: runtime.Store, Artifacts: runtime.Artifacts, Submitter: runtime,
 			MetricsEnabled: enabled, Token: "metrics-token", Mode: runtime.Mode,
 			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := httptest.NewServer(handler)
-		t.Cleanup(server.Close)
-		return server
 	}
 
 	enabled := newServer(true)
@@ -275,29 +307,55 @@ func TestMetricsRequireAuthenticationAndRespectConfiguration(t *testing.T) {
 
 func TestServerPluginLifecycle(t *testing.T) {
 	t.Parallel()
+	workspaceRoot := t.TempDir()
 	runtime, err := app.Open(t.Context(), app.Config{
-		DataDir: t.TempDir(),
-		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir:      t.TempDir(),
+		WorkspaceDir: workspaceRoot,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("app.Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	handler, err := New(Config{
-		Store:     runtime.Store,
-		Artifacts: runtime.Artifacts,
-		Submitter: runtime,
-		Plugins:   runtime.Plugins,
-		Token:     "plugin-token",
-		Mode:      runtime.Mode,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	pluginImportRoot, err := os.OpenRoot(workspaceRoot)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("os.OpenRoot() error = %v", err)
 	}
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-	source := createHTTPPluginPackage(t, "dev.kern.http")
+	t.Cleanup(func() { _ = pluginImportRoot.Close() })
+	server := newLoopbackTestServer(t, Config{
+		Store:            runtime.Store,
+		Artifacts:        runtime.Artifacts,
+		Submitter:        runtime,
+		Plugins:          runtime.Plugins,
+		PluginImportRoot: pluginImportRoot,
+		Token:            "plugin-token",
+		Mode:             runtime.Mode,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	const source = "packages/http"
+	createHTTPPluginPackage(t, filepath.Join(workspaceRoot, filepath.FromSlash(source)), "dev.kern.http")
+	for _, unsafeSource := range []string{
+		filepath.Join(workspaceRoot, filepath.FromSlash(source)),
+		"../http",
+		`packages\http`,
+		"packages/http\x00ignored",
+	} {
+		unsafeBody, marshalErr := json.Marshal(map[string]any{"source": unsafeSource})
+		if marshalErr != nil {
+			t.Fatalf("json.Marshal(unsafe source) error = %v", marshalErr)
+		}
+		response := pluginRequest(
+			t,
+			server.Client(),
+			http.MethodPost,
+			server.URL+"/api/v1/plugins/install",
+			unsafeBody,
+		)
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("unsafe source %q status = %d, want %d", unsafeSource, response.StatusCode, http.StatusBadRequest)
+		}
+	}
 	installBody, err := json.Marshal(map[string]any{"source": source, "enable": true})
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
@@ -396,21 +454,16 @@ func TestServerEvaluationAPI(t *testing.T) {
 		StartedAt: now, CompletedAt: now,
 	}
 	evals := &fakeEvaluationManager{run: run, report: report}
-	handler, err := New(Config{
+	server := newLoopbackTestServer(t, Config{
 		Store: runtime.Store, Artifacts: runtime.Artifacts, Submitter: runtime,
 		Evals: evals, Token: "eval-token", Mode: runtime.Mode,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
 
-	response := authenticatedRequest(t, server.Client(), "eval-token", http.MethodPost, server.URL+"/api/v1/evals/runs", []byte(`{"suite_path":"/evals/go","variants":["general.base"]}`))
+	response := authenticatedRequest(t, server.Client(), "eval-token", http.MethodPost, server.URL+"/api/v1/evals/runs", []byte(`{"suite_path":"evals/go","variants":["general.base"]}`))
 	body, readErr := io.ReadAll(response.Body)
 	response.Body.Close()
-	if readErr != nil || response.StatusCode != http.StatusAccepted || !strings.Contains(string(body), `"id":"eval-run"`) || evals.input.SuitePath != "/evals/go" {
+	if readErr != nil || response.StatusCode != http.StatusAccepted || !strings.Contains(string(body), `"id":"eval-run"`) || evals.input.SuitePath != "evals/go" {
 		t.Fatalf("start eval status=%d body=%s error=%v input=%#v", response.StatusCode, body, readErr, evals.input)
 	}
 	for _, endpoint := range []string{"/api/v1/evals/runs", "/api/v1/evals/runs/eval-run"} {
@@ -456,16 +509,11 @@ func TestServerSettingsAndConfirmedCleanupFlow(t *testing.T) {
 		t.Fatalf("app.Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	handler, err := New(Config{
+	server := newLoopbackTestServer(t, Config{
 		Store: runtime.Store, Artifacts: runtime.Artifacts, Submitter: runtime,
 		Token: "settings-token", Mode: runtime.Mode,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	server := httptest.NewServer(handler)
-	defer server.Close()
 	response := authenticatedRequest(
 		t, server.Client(), "settings-token", http.MethodGet, server.URL+"/api/v1/settings", nil,
 	)
@@ -646,9 +694,11 @@ func (manager *fakeEvaluationManager) Report(_ context.Context, runID string) (e
 	return manager.report, nil
 }
 
-func createHTTPPluginPackage(t *testing.T, pluginID string) string {
+func createHTTPPluginPackage(t *testing.T, directory, pluginID string) {
 	t.Helper()
-	directory := t.TempDir()
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(directory, "knowledge.md"), []byte("HTTP plugin evidence\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -674,7 +724,6 @@ func createHTTPPluginPackage(t *testing.T, pluginID string) string {
 	if err := os.WriteFile(filepath.Join(directory, plugin.ManifestFile), encoded, 0o600); err != nil {
 		t.Fatalf("WriteFile(manifest) error = %v", err)
 	}
-	return directory
 }
 
 func TestServerModelConfigAndTaskSelectionFlow(t *testing.T) {
@@ -711,7 +760,7 @@ func TestServerModelConfigAndTaskSelectionFlow(t *testing.T) {
 		t.Fatalf("app.Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	handler, err := New(Config{
+	server := newLoopbackTestServer(t, Config{
 		Store:     runtime.Store,
 		Artifacts: runtime.Artifacts,
 		Submitter: runtime,
@@ -720,17 +769,7 @@ func TestServerModelConfigAndTaskSelectionFlow(t *testing.T) {
 		Mode:      runtime.Mode,
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	server := httptest.NewServer(handler)
-	defer server.Close()
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar.New() error = %v", err)
-	}
-	client := server.Client()
-	client.Jar = jar
+	client := authenticatedTestClient(server, "model-test-token")
 	response, err := client.Get(server.URL + "/")
 	if err != nil {
 		t.Fatalf("GET / error = %v", err)
@@ -875,22 +914,12 @@ func TestServerReportsUnavailableCredentialServiceAndRejectsRawKey(t *testing.T)
 		t.Fatalf("app.Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	handler, err := New(Config{
+	server := newLoopbackTestServer(t, Config{
 		Store: runtime.Store, Artifacts: runtime.Artifacts, Submitter: runtime,
 		Models: runtime, Token: "unavailable-vault-token", Mode: runtime.Mode,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	server := httptest.NewServer(handler)
-	defer server.Close()
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar.New() error = %v", err)
-	}
-	client := server.Client()
-	client.Jar = jar
+	client := authenticatedTestClient(server, "unavailable-vault-token")
 	response, err := client.Get(server.URL + "/")
 	if err != nil {
 		t.Fatalf("GET / error = %v", err)
@@ -955,6 +984,22 @@ func TestServerMapsNativeCredentialErrorsWithoutLeakingBackendDetails(t *testing
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestServerInternalErrorNeverLogsTheCause(t *testing.T) {
+	const secretValue = "sk-must-never-appear-in-logs"
+	var logs bytes.Buffer
+	server := &Server{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/model-configs", nil)
+
+	server.internalError(response, request, errors.New("credential adapter echoed "+secretValue))
+
+	if response.Code != http.StatusInternalServerError || strings.Contains(logs.String(), secretValue) ||
+		strings.Contains(logs.String(), "credential adapter echoed") ||
+		!strings.Contains(logs.String(), "error_kind=internal") {
+		t.Fatalf("status=%d logs=%q", response.Code, logs.String())
 	}
 }
 
@@ -1045,14 +1090,269 @@ func doJSONMutation(
 	return response
 }
 
+func TestNewRequiresExplicitTrustedOrigin(t *testing.T) {
+	t.Parallel()
+	store := &stubStore{}
+	base := Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"}
+
+	tests := []struct {
+		name                   string
+		origin                 string
+		allowPlainHTTPLoopback bool
+	}{
+		{name: "missing origin"},
+		{name: "external HTTP origin", origin: "http://agent.example.test:8787", allowPlainHTTPLoopback: true},
+		{name: "implicit insecure loopback transport", origin: "http://127.0.0.1:8787"},
+		{name: "insecure exception on HTTPS", origin: "https://127.0.0.1", allowPlainHTTPLoopback: true},
+		{name: "external HTTPS origin", origin: "https://agent.example.test"},
+		{name: "zero port", origin: "https://agent.example.test:0"},
+		{name: "oversized port", origin: "https://agent.example.test:65536"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := base
+			config.Origin = tt.origin
+			config.AllowPlainHTTPLoopback = tt.allowPlainHTTPLoopback
+			if _, err := New(config); err == nil {
+				t.Fatal("New() error = nil")
+			}
+		})
+	}
+
+	secure := base
+	secure.Origin = "https://127.0.0.1"
+	if _, err := New(secure); err != nil {
+		t.Fatalf("New(HTTPS) error = %v", err)
+	}
+	loopback := base
+	loopback.Origin = "http://127.0.0.1:8787"
+	loopback.AllowPlainHTTPLoopback = true
+	if _, err := New(loopback); err != nil {
+		t.Fatalf("New(explicit HTTP loopback) error = %v", err)
+	}
+}
+
+func TestCanonicalAuthorityNormalizesDefaultPorts(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		scheme    string
+		raw       string
+		authority string
+	}{
+		{name: "implicit HTTPS", scheme: "https", raw: "agent.example.test", authority: "agent.example.test"},
+		{name: "explicit HTTPS default", scheme: "https", raw: "agent.example.test:443", authority: "agent.example.test"},
+		{name: "implicit HTTP IPv6", scheme: "http", raw: "[::1]", authority: "[::1]"},
+		{name: "explicit HTTP default IPv6", scheme: "http", raw: "[::1]:80", authority: "[::1]"},
+		{name: "nondefault port", scheme: "https", raw: "agent.example.test:8443", authority: "agent.example.test:8443"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authority, _, err := canonicalAuthority(tt.scheme, tt.raw)
+			if err != nil || authority != tt.authority {
+				t.Fatalf("canonicalAuthority() = %q, %v; want %q", authority, err, tt.authority)
+			}
+		})
+	}
+	for _, raw := range []string{"agent.example.test:0", "agent.example.test:65536", "agent.example.test:080"} {
+		if _, _, err := canonicalAuthority("https", raw); err == nil {
+			t.Fatalf("canonicalAuthority(%q) error = nil", raw)
+		}
+	}
+}
+
+func TestServerLocksTransportHostOriginAndBootstrapToken(t *testing.T) {
+	t.Parallel()
+	const trustedOrigin = "http://127.0.0.1:8787"
+	store := &stubStore{item: task.Task{ID: "task-1", Status: task.StatusRunning}}
+	server, err := New(Config{
+		Store: store, Artifacts: store, Submitter: store,
+		Token: "session-secret", Mode: "test", Origin: trustedOrigin,
+		AllowPlainHTTPLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://evil.example:8787/", nil)
+	request.RemoteAddr = "127.0.0.1:51000"
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("untrusted Host status = %d, want %d", response.Code, http.StatusMisdirectedRequest)
+	}
+	if header := response.Header().Get("Set-Cookie"); header != "" {
+		t.Fatalf("untrusted Host received Set-Cookie = %q", header)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "http://evil.example:8787/api/v1/tasks/task-1/pause", nil)
+	request.RemoteAddr = "127.0.0.1:51001"
+	request.Header.Set("Origin", "http://evil.example:8787")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest || store.lastAction != "" {
+		t.Fatalf("rebound mutation status=%d action=%q", response.Code, store.lastAction)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://evil.example:8787/api/v1/tasks", nil)
+	request.RemoteAddr = "127.0.0.1:51002"
+	request.Header.Set("Authorization", "Bearer session-secret")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("Bearer request with untrusted Host status = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://evil.example:8787/", nil)
+	request.Host = "127.0.0.1:8787"
+	request.RemoteAddr = "127.0.0.1:51003"
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("untrusted absolute request target status = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, trustedOrigin+"/", nil)
+	request.RemoteAddr = "192.0.2.1:51004"
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("trusted Host with non-loopback peer status = %d", response.Code)
+	}
+	if header := response.Header().Get("Set-Cookie"); header != "" {
+		t.Fatalf("non-loopback peer received Set-Cookie = %q", header)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, trustedOrigin+"/api/v1/tasks/task-1/pause", nil)
+	request.RemoteAddr = "127.0.0.1:51005"
+	request.Header.Set("Origin", "http://evil.example:8787")
+	request.Header.Set("Authorization", "Bearer session-secret")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || store.lastAction != "" {
+		t.Fatalf("untrusted Origin status=%d action=%q", response.Code, store.lastAction)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, trustedOrigin+"/", nil)
+	request.RemoteAddr = "127.0.0.1:51006"
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("trusted Host status = %d", response.Code)
+	}
+	if header := response.Header().Get("Set-Cookie"); header != "" {
+		t.Fatalf("trusted Host received Set-Cookie = %q", header)
+	}
+	bootstrapToken := bootstrapTokenFromHTML(t, response.Body.String())
+	if bootstrapToken == "session-secret" {
+		t.Fatal("bootstrap exposed the configured API token")
+	}
+
+	request = httptest.NewRequest(http.MethodPost, trustedOrigin+"/api/v1/tasks/task-1/pause", nil)
+	request.RemoteAddr = "127.0.0.1:51007"
+	request.Header.Set("Origin", trustedOrigin)
+	request.Header.Set("Authorization", "Bearer "+bootstrapToken)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || store.lastAction != "pause" {
+		t.Fatalf("trusted mutation status=%d action=%q body=%s", response.Code, store.lastAction, response.Body)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, trustedOrigin+"/api/v1/tasks", nil)
+	request.RemoteAddr = "127.0.0.1:51008"
+	request.Header.Set("Authorization", "Bearer "+bootstrapToken+"tampered")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("tampered bootstrap token status = %d", response.Code)
+	}
+}
+
+func TestServerEnforcesConfiguredTLSMode(t *testing.T) {
+	t.Parallel()
+	store := &stubStore{}
+	server, err := New(Config{
+		Store: store, Artifacts: store, Submitter: store,
+		Token: "session-secret", Mode: "test", Origin: "https://127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://127.0.0.1/", nil)
+	request.RemoteAddr = "127.0.0.1:51010"
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("HTTPS response status=%d cookie=%q", response.Code, response.Header().Get("Set-Cookie"))
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "https://127.0.0.1/", nil)
+	request.RemoteAddr = "192.0.2.1:51012"
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("non-loopback HTTPS peer status = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:51011"
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("plain request to HTTPS configuration status = %d", response.Code)
+	}
+
+	httpServer, err := New(Config{
+		Store: store, Artifacts: store, Submitter: store,
+		Token: "session-secret", Mode: "test", Origin: "http://127.0.0.1:8787",
+		AllowPlainHTTPLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("New(HTTP) error = %v", err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "https://127.0.0.1:8787/", nil)
+	request.RemoteAddr = "127.0.0.1:51009"
+	response = httptest.NewRecorder()
+	httpServer.ServeHTTP(response, request)
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("TLS request to HTTP configuration status = %d", response.Code)
+	}
+}
+
+func TestBrowserSessionTokenExpiresAndCannotBeForged(t *testing.T) {
+	t.Parallel()
+	store := &stubStore{}
+	server, err := New(Config{
+		Store: store, Artifacts: store, Submitter: store,
+		Token: "persistent-api-token", Mode: "test", Origin: "https://127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	issuedAt := time.Unix(1_800_000_000, 0)
+	token, err := server.issueBrowserToken(issuedAt)
+	if err != nil {
+		t.Fatalf("issueBrowserToken() error = %v", err)
+	}
+	if !server.validBrowserToken(token, issuedAt.Add(browserSessionTTL-time.Second)) {
+		t.Fatal("browser token expired before its deadline")
+	}
+	if server.validBrowserToken(token, issuedAt.Add(browserSessionTTL+time.Second)) {
+		t.Fatal("browser token remained valid after its deadline")
+	}
+	if server.validBrowserToken(token+"x", issuedAt) {
+		t.Fatal("forged browser token was accepted")
+	}
+}
+
 func TestServerRejectsUnauthenticatedAPI(t *testing.T) {
 	t.Parallel()
 
 	store := &stubStore{}
-	server, err := New(Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	server := newDirectTestHandler(t, Config{
+		Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test",
+	})
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/tasks", nil)
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)
@@ -1064,10 +1364,9 @@ func TestServerRejectsUnauthenticatedAPI(t *testing.T) {
 func TestServerTaskControlActions(t *testing.T) {
 	t.Parallel()
 	store := &stubStore{item: task.Task{ID: "task-1", Status: task.StatusRunning}}
-	server, err := New(Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	server := newDirectTestHandler(t, Config{
+		Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test",
+	})
 	tests := []struct {
 		name       string
 		path       string
@@ -1098,10 +1397,9 @@ func TestServerTaskControlActions(t *testing.T) {
 func TestServerAcceptsSupplementaryTaskInput(t *testing.T) {
 	t.Parallel()
 	store := &stubStore{item: task.Task{ID: "task-1", Status: task.StatusCreated}}
-	server, err := New(Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	server := newDirectTestHandler(t, Config{
+		Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test",
+	})
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/tasks/task-1/messages",
@@ -1147,10 +1445,9 @@ func TestServerApprovalEndpoints(t *testing.T) {
 			Status:      approval.StatusPending,
 		}},
 	}
-	server, err := New(Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	server := newDirectTestHandler(t, Config{
+		Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test",
+	})
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-1/approvals", nil)
 	request.Header.Set("Authorization", "Bearer secret")
 	response := httptest.NewRecorder()
@@ -1185,10 +1482,9 @@ func TestServerUncertainOperationEndpoints(t *testing.T) {
 			Status: operation.StatusUncertain,
 		}},
 	}
-	server, err := New(Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	server := newDirectTestHandler(t, Config{
+		Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test",
+	})
 	request := httptest.NewRequest(
 		http.MethodGet,
 		"/api/v1/tasks/task-1/operations/uncertain",
@@ -1234,10 +1530,9 @@ func TestServerCurrentPlanEndpoint(t *testing.T) {
 			}},
 		},
 	}
-	server, err := New(Config{Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	server := newDirectTestHandler(t, Config{
+		Store: store, Artifacts: store, Submitter: store, Token: "secret", Mode: "test",
+	})
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-1/plan", nil)
 	request.Header.Set("Authorization", "Bearer secret")
 	response := httptest.NewRecorder()
@@ -1246,6 +1541,110 @@ func TestServerCurrentPlanEndpoint(t *testing.T) {
 		!strings.Contains(response.Body.String(), "Inspect") {
 		t.Fatalf("GET plan status = %d, body = %s", response.Code, response.Body)
 	}
+}
+
+func TestServerShutdownCancelsAdmittedRequests(t *testing.T) {
+	t.Parallel()
+	store := &blockingStore{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	server, err := New(Config{
+		Store: store, Artifacts: store, Submitter: store,
+		Token: "secret", Mode: "test", Origin: "http://127.0.0.1:8787",
+		AllowPlainHTTPLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/v1/tasks", nil)
+		request.RemoteAddr = "127.0.0.1:51000"
+		request.Header.Set("Authorization", "Bearer secret")
+		server.ServeHTTP(httptest.NewRecorder(), request)
+	}()
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("request did not enter dependency")
+	}
+
+	server.BeginShutdown()
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/v1/tasks", nil)
+	request.RemoteAddr = "127.0.0.1:51001"
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || store.callCount() != 1 {
+		t.Fatalf("new request status=%d dependency calls=%d", response.Code, store.callCount())
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("admitted request was not cancelled")
+	}
+	if err := server.WaitForIdle(t.Context()); err != nil {
+		t.Fatalf("WaitForIdle() error = %v", err)
+	}
+}
+
+func TestServerShutdownStopsAdmittedEventStream(t *testing.T) {
+	t.Parallel()
+	store := &stubStore{item: task.Task{ID: "task-1"}}
+	server, err := New(Config{
+		Store: store, Artifacts: store, Submitter: store,
+		Token: "secret", Mode: "test", Origin: "http://127.0.0.1:8787",
+		AllowPlainHTTPLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	writer := newStreamResponseWriter()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		request := httptest.NewRequest(
+			http.MethodGet,
+			"http://127.0.0.1:8787/api/v1/tasks/task-1/events",
+			nil,
+		)
+		request.RemoteAddr = "127.0.0.1:51000"
+		request.Header.Set("Authorization", "Bearer secret")
+		server.ServeHTTP(writer, request)
+	}()
+	select {
+	case <-writer.flushed:
+	case <-time.After(time.Second):
+		t.Fatal("event stream did not flush its response headers")
+	}
+
+	server.BeginShutdown()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event stream did not stop during shutdown")
+	}
+	if err := server.WaitForIdle(t.Context()); err != nil {
+		t.Fatalf("WaitForIdle() error = %v", err)
+	}
+}
+
+func bootstrapTokenFromHTML(t *testing.T, body string) string {
+	t.Helper()
+	const prefix = `<meta name="kern-session-token" content="`
+	start := strings.Index(body, prefix)
+	if start < 0 {
+		t.Fatalf("bootstrap token missing from %s", body)
+	}
+	start += len(prefix)
+	end := strings.Index(body[start:], `">`)
+	if end < 0 {
+		t.Fatalf("bootstrap token is unterminated in %s", body)
+	}
+	return body[start : start+end]
 }
 
 func jsonField(t *testing.T, body []byte, field string) string {
@@ -1272,6 +1671,66 @@ type stubStore struct {
 	uncertain     []operation.Operation
 	currentPlan   plan.Plan
 	verifications []task.Verification
+}
+
+type blockingStore struct {
+	stubStore
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+type streamResponseWriter struct {
+	header    http.Header
+	flushed   chan struct{}
+	flushOnce sync.Once
+	mu        sync.Mutex
+	status    int
+}
+
+func newStreamResponseWriter() *streamResponseWriter {
+	return &streamResponseWriter{header: make(http.Header), flushed: make(chan struct{})}
+}
+
+func (w *streamResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *streamResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	w.status = status
+	w.mu.Unlock()
+}
+
+func (w *streamResponseWriter) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (w *streamResponseWriter) Flush() {
+	w.flushOnce.Do(func() { close(w.flushed) })
+}
+
+func (s *blockingStore) ListTasks(ctx context.Context, _ int) ([]task.Task, error) {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	s.mu.Unlock()
+	if first {
+		close(s.entered)
+	}
+	select {
+	case <-s.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *blockingStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 func (s *stubStore) GetTask(context.Context, string) (task.Task, error) {

@@ -295,7 +295,7 @@ func TestClientTaskArtifactAndErrorFlow(t *testing.T) {
 	if _, err := client.ResolveUncertainOperation(t.Context(), uncertain[0].ID, "maybe"); err == nil {
 		t.Fatal("ResolveUncertainOperation(invalid) error = nil")
 	}
-	evalRun, err := client.StartEvaluation(t.Context(), StartEvaluationInput{SuitePath: "/evals/go", Variants: []string{"general.base"}})
+	evalRun, err := client.StartEvaluation(t.Context(), StartEvaluationInput{SuitePath: "evals/go", Variants: []string{"general.base"}})
 	if err != nil || evalRun.ID != "eval-1" || evalRun.Status != EvaluationQueued {
 		t.Fatalf("StartEvaluation() = %#v, %v", evalRun, err)
 	}

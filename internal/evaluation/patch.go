@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -20,21 +19,31 @@ const (
 	maxPatchBytes = int64(512 << 20)
 )
 
-func gradePatchRule(ctx context.Context, baselineDir, workspaceDir string, grader Grader) GradeResult {
+func gradePatchRule(
+	ctx context.Context,
+	baselineDir string,
+	baselineFiles map[string]string,
+	workspaceDir string,
+	grader Grader,
+) GradeResult {
 	result := GradeResult{
 		GraderID: grader.ID, Status: GradePassed, Score: 1,
 		ReasonCode: "patch_rule_passed", Details: make(map[string]any),
 	}
-	if strings.TrimSpace(baselineDir) == "" {
+	if baselineFiles == nil && strings.TrimSpace(baselineDir) == "" {
 		result.Status = GradeError
 		result.Score = 0
 		result.ReasonCode = "patch_baseline_unavailable"
 		result.Details["error"] = "evaluation baseline is unavailable"
 		return result
 	}
-	baseline, err := snapshotFiles(ctx, baselineDir)
-	if err != nil {
-		return patchInfrastructureError(result, "baseline", err)
+	baseline := baselineFiles
+	if baseline == nil {
+		var err error
+		baseline, err = snapshotFiles(ctx, baselineDir)
+		if err != nil {
+			return patchInfrastructureError(result, "baseline", err)
+		}
 	}
 	current, err := snapshotFiles(ctx, workspaceDir)
 	if err != nil {
@@ -73,20 +82,37 @@ func snapshotFiles(ctx context.Context, root string) (map[string]string, error) 
 	if err != nil {
 		return nil, err
 	}
+	rootHandle, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, err
+	}
+	defer rootHandle.Close()
+	return snapshotRoot(ctx, rootHandle)
+}
+
+func snapshotRoot(ctx context.Context, root *os.Root) (map[string]string, error) {
+	return snapshotRootWithLimits(ctx, root, maxPatchFiles, maxPatchBytes)
+}
+
+func snapshotRootWithLimits(
+	ctx context.Context,
+	root *os.Root,
+	maxFiles int,
+	maxBytes int64,
+) (map[string]string, error) {
+	if root == nil {
+		return nil, errors.New("evaluation: snapshot root is unavailable")
+	}
 	result := make(map[string]string)
 	var total int64
-	err = filepath.WalkDir(absolute, func(name string, entry fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		relative, err := filepath.Rel(absolute, name)
-		if err != nil {
-			return err
-		}
-		if relative == "." {
+		if name == "." {
 			return nil
 		}
 		if entry.IsDir() {
@@ -96,30 +122,25 @@ func snapshotFiles(ctx context.Context, root string) (map[string]string, error) 
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
-			return fmt.Errorf("evaluation: patch snapshot rejects non-regular file %q", relative)
+			return fmt.Errorf("evaluation: patch snapshot rejects non-regular file %q", name)
 		}
-		if len(result) >= maxPatchFiles {
+		if len(result) >= maxFiles {
 			return errors.New("evaluation: patch snapshot file limit exceeded")
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		total += info.Size()
-		if total > maxPatchBytes {
-			return errors.New("evaluation: patch snapshot byte limit exceeded")
-		}
-		file, err := os.Open(name)
-		if err != nil {
-			return err
+		local := filepath.FromSlash(name)
+		if !filepath.IsLocal(local) {
+			return fmt.Errorf("evaluation: patch snapshot path %q is not local", name)
 		}
 		hash := sha256.New()
-		_, copyErr := io.Copy(hash, file)
-		closeErr := file.Close()
-		if err := errors.Join(copyErr, closeErr); err != nil {
+		copied, _, err := readRootFile(ctx, root, local, maxBytes-total, hash)
+		total += copied
+		if errors.Is(err, errFileByteLimit) {
+			return errors.New("evaluation: patch snapshot byte limit exceeded")
+		}
+		if err != nil {
 			return err
 		}
-		result[filepath.ToSlash(relative)] = hex.EncodeToString(hash.Sum(nil))
+		result[name] = hex.EncodeToString(hash.Sum(nil))
 		return nil
 	})
 	return result, err

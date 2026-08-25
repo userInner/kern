@@ -3,11 +3,211 @@ package evaluation
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestLoadFromRootConfinesSuiteSelection(t *testing.T) {
+	evalRoot := t.TempDir()
+	writeSuiteFiles(t, filepath.Join(evalRoot, "trusted"), validSuite())
+
+	loaded, err := LoadFromRoot(evalRoot, "./trusted")
+	if err != nil {
+		t.Fatalf("LoadFromRoot(valid) error = %v", err)
+	}
+	if prompt, err := loaded.PromptText(loaded.Cases[0]); err != nil || prompt != "Fix the failing test.\n" {
+		t.Fatalf("PromptText() = %q, %v", prompt, err)
+	}
+	defer loaded.Close()
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "absolute", path: filepath.Join(evalRoot, "trusted")},
+		{name: "parent traversal", path: "../trusted"},
+		{name: "embedded traversal", path: "nested/../trusted"},
+		{name: "backslash", path: `nested\trusted`},
+		{name: "drive qualified", path: "C:/trusted"},
+		{name: "NUL", path: "trusted\x00ignored"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := LoadFromRoot(evalRoot, test.path); !errors.Is(err, ErrInvalidSuite) {
+				t.Fatalf("LoadFromRoot(%q) error = %v, want ErrInvalidSuite", test.path, err)
+			}
+		})
+	}
+}
+
+func TestLoadFromRootRejectsSuiteDirectorySymlinkEscape(t *testing.T) {
+	evalRoot := t.TempDir()
+	outside := t.TempDir()
+	writeSuiteFiles(t, outside, validSuite())
+	requireSymlink(t, outside, filepath.Join(evalRoot, "escaped"))
+
+	if _, err := LoadFromRoot(evalRoot, "escaped"); err == nil {
+		t.Fatal("LoadFromRoot(symlink escape) error = nil")
+	}
+}
+
+func TestLoadFromRootHandleSurvivesRootPathReplacement(t *testing.T) {
+	evalRoot := t.TempDir()
+	writeSuiteFiles(t, filepath.Join(evalRoot, "trusted"), validSuite())
+	root, err := os.OpenRoot(evalRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	loaded, err := LoadFromRootHandle(root, "trusted")
+	if err != nil {
+		t.Fatalf("LoadFromRootHandle() error = %v", err)
+	}
+	moved := t.TempDir()
+	if err := os.Remove(moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(evalRoot, moved); err != nil {
+		t.Skipf("Rename(root) unavailable: %v", err)
+	}
+	if err := os.Mkdir(evalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeSuiteFiles(t, filepath.Join(evalRoot, "trusted"), validSuite())
+	if err := os.WriteFile(
+		filepath.Join(evalRoot, "trusted", "prompt.md"),
+		[]byte("attacker replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, err := loaded.PromptText(loaded.Cases[0])
+	if err != nil || prompt != "Fix the failing test.\n" {
+		t.Fatalf("PromptText() = %q, %v", prompt, err)
+	}
+}
+
+func TestSnapshotFreezesPromptAndFixture(t *testing.T) {
+	sourceRoot := t.TempDir()
+	writeSuiteFiles(t, filepath.Join(sourceRoot, "trusted"), validSuite())
+	source, err := LoadFromRoot(sourceRoot, "trusted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	snapshot, err := Snapshot(t.Context(), source, filepath.Join(t.TempDir(), "input"))
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	defer snapshot.Close()
+	before, _, err := PrepareRun(snapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(sourceRoot, "trusted", "prompt.md"),
+		[]byte("changed after snapshot\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(sourceRoot, "trusted", "fixture", "go.mod"),
+		[]byte("module attacker.example/changed\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := PrepareRun(snapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("snapshot digest changed: %s -> %s", before, after)
+	}
+	prompt, err := snapshot.PromptText(snapshot.Cases[0])
+	if err != nil || prompt != "Fix the failing test.\n" {
+		t.Fatalf("snapshot PromptText() = %q, %v", prompt, err)
+	}
+}
+
+func TestSuiteInputsRejectSymlinkEscape(t *testing.T) {
+	t.Run("final prompt symlink", func(t *testing.T) {
+		evalRoot := t.TempDir()
+		suiteRoot := filepath.Join(evalRoot, "suite")
+		writeSuiteFiles(t, suiteRoot, validSuite())
+		outside := filepath.Join(t.TempDir(), "secret.txt")
+		if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(suiteRoot, "prompt.md")); err != nil {
+			t.Fatal(err)
+		}
+		requireSymlink(t, outside, filepath.Join(suiteRoot, "prompt.md"))
+
+		suite, err := LoadFromRoot(evalRoot, "suite")
+		if err != nil {
+			t.Fatalf("LoadFromRoot() error = %v", err)
+		}
+		defer suite.Close()
+		if _, err := suite.PromptText(suite.Cases[0]); err == nil {
+			t.Fatal("PromptText(symlink escape) error = nil")
+		}
+	})
+
+	t.Run("intermediate prompt symlink", func(t *testing.T) {
+		evalRoot := t.TempDir()
+		suiteRoot := filepath.Join(evalRoot, "suite")
+		suite := validSuite()
+		suite.Cases[0].Prompt = "escaped/secret.txt"
+		writeSuiteFiles(t, suiteRoot, suite)
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		requireSymlink(t, outside, filepath.Join(suiteRoot, "escaped"))
+
+		loaded, err := LoadFromRoot(evalRoot, "suite")
+		if err != nil {
+			t.Fatalf("LoadFromRoot() error = %v", err)
+		}
+		defer loaded.Close()
+		if _, err := loaded.PromptText(loaded.Cases[0]); err == nil {
+			t.Fatal("PromptText(intermediate symlink escape) error = nil")
+		}
+	})
+
+	t.Run("intermediate fixture symlink", func(t *testing.T) {
+		evalRoot := t.TempDir()
+		suiteRoot := filepath.Join(evalRoot, "suite")
+		suite := validSuite()
+		suite.Cases[0].Fixture = "escaped/fixture"
+		writeSuiteFiles(t, suiteRoot, suite)
+		outside := t.TempDir()
+		if err := os.Mkdir(filepath.Join(outside, "fixture"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, "fixture", "secret.txt"), []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		requireSymlink(t, outside, filepath.Join(suiteRoot, "escaped"))
+
+		loaded, err := LoadFromRoot(evalRoot, "suite")
+		if err != nil {
+			t.Fatalf("LoadFromRoot() error = %v", err)
+		}
+		defer loaded.Close()
+		if _, err := loaded.openFixture(loaded.Cases[0]); err == nil {
+			t.Fatal("openFixture(intermediate symlink escape) error = nil")
+		}
+		if _, _, err := PrepareRun(loaded, nil); err == nil {
+			t.Fatal("PrepareRun(intermediate symlink escape) error = nil")
+		}
+	})
+}
 
 func TestLoadSuiteAndResolveInputs(t *testing.T) {
 	root := t.TempDir()
@@ -34,9 +234,12 @@ func TestLoadSuiteAndResolveInputs(t *testing.T) {
 	if err != nil || prompt != "Fix the failing test.\n" {
 		t.Fatalf("PromptText() = %q, %v", prompt, err)
 	}
-	fixture, err := loaded.FixturePath(loaded.Cases[0])
-	if err != nil || fixture != filepath.Join(root, "fixture") {
-		t.Fatalf("FixturePath() = %q, %v", fixture, err)
+	fixture, err := loaded.openFixture(loaded.Cases[0])
+	if err != nil {
+		t.Fatalf("openFixture() error = %v", err)
+	}
+	if err := fixture.Close(); err != nil {
+		t.Fatalf("Close(fixture) error = %v", err)
 	}
 }
 
@@ -54,8 +257,13 @@ func TestShippedGoReferenceSuite(t *testing.T) {
 		if _, err := suite.PromptText(evalCase); err != nil {
 			t.Errorf("PromptText(%s) error = %v", evalCase.ID, err)
 		}
-		if _, err := suite.FixturePath(evalCase); err != nil {
-			t.Errorf("FixturePath(%s) error = %v", evalCase.ID, err)
+		fixture, err := suite.openFixture(evalCase)
+		if err != nil {
+			t.Errorf("openFixture(%s) error = %v", evalCase.ID, err)
+			continue
+		}
+		if err := fixture.Close(); err != nil {
+			t.Errorf("Close(fixture %s) error = %v", evalCase.ID, err)
 		}
 	}
 }
@@ -261,5 +469,29 @@ func validSuite() Suite {
 			ID: "go.test-case", Fixture: "fixture", Prompt: "prompt.md",
 			Graders: []Grader{{ID: "go.test", Type: "command", Required: true, Command: []string{"go", "test", "./..."}}},
 		}},
+	}
+}
+
+func writeSuiteFiles(t *testing.T, root string, suite Suite) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "prompt.md"), []byte("Fix the failing test.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "suite.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symbolic links are unavailable: %v", err)
 	}
 }

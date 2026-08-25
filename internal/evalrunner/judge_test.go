@@ -4,10 +4,30 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/userInner/kern/internal/evaluation"
 )
+
+func TestCompatibleJudgeMissingCredentialDoesNotExposeReference(t *testing.T) {
+	const environmentName = "KERN_SENTINEL_JUDGE_KEY"
+	t.Setenv(environmentName, "")
+
+	_, err := NewCompatibleJudge(evaluation.JudgeConfig{
+		Provider:  "openai-compatible",
+		BaseURL:   "https://models.example.test",
+		Model:     "judge-model",
+		APIKeyEnv: environmentName,
+		MaxTokens: 128,
+	})
+	if err == nil {
+		t.Fatal("NewCompatibleJudge() error = nil")
+	}
+	if strings.Contains(err.Error(), environmentName) {
+		t.Fatalf("NewCompatibleJudge() error exposed credential reference: %v", err)
+	}
+}
 
 func TestCompatibleJudgeUsesNoToolsAndParsesStrictResult(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -161,9 +160,13 @@ func (r *Runner) RunWithIDProgressFrom(
 	if err != nil {
 		return Report{}, err
 	}
-	configDigest, reproducibility, err := suiteDigest(suite, variants)
+	configDigest, reproducibility, err := suiteDigest(ctx, suite, variants)
 	if err != nil {
 		return Report{}, err
+	}
+	expectedInputs := make(map[string]InputDigest, len(reproducibility.Inputs))
+	for _, input := range reproducibility.Inputs {
+		expectedInputs[input.CaseID] = input
 	}
 	completedJobs, err := validatePriorResults(suite, variants, prior)
 	if err != nil {
@@ -193,7 +196,14 @@ func (r *Runner) RunWithIDProgressFrom(
 			for job := range jobs {
 				func() {
 					defer close(job.done)
-					completed := r.runCase(runCtx, runID, suite, job.variant, job.evalCase)
+					completed := r.runCase(
+						runCtx,
+						runID,
+						suite,
+						job.variant,
+						job.evalCase,
+						expectedInputs[job.evalCase.ID],
+					)
 					select {
 					case results <- jobResult{variantID: job.variant.ID, caseID: job.evalCase.ID, results: completed}:
 					case <-runCtx.Done():
@@ -282,6 +292,12 @@ func (r *Runner) RunWithIDProgressFrom(
 // case starts. Resume must produce the same digest before prior results may be
 // combined with new work.
 func PrepareRun(suite Suite, selected []string) (string, Reproducibility, error) {
+	return PrepareRunContext(context.Background(), suite, selected)
+}
+
+// PrepareRunContext computes a run identity while honoring cancellation during
+// fixture hashing. PrepareRun is retained for callers without a context.
+func PrepareRunContext(ctx context.Context, suite Suite, selected []string) (string, Reproducibility, error) {
 	if err := Validate(suite); err != nil {
 		return "", Reproducibility{}, err
 	}
@@ -289,7 +305,7 @@ func PrepareRun(suite Suite, selected []string) (string, Reproducibility, error)
 	if err != nil {
 		return "", Reproducibility{}, err
 	}
-	return suiteDigest(suite, variants)
+	return suiteDigest(ctx, suite, variants)
 }
 
 func validatePriorResults(suite Suite, variants []Variant, prior []CaseResult) (map[string]bool, error) {
@@ -322,15 +338,31 @@ func resultJobKey(variantID, caseID string) string {
 	return variantID + "\x00" + caseID
 }
 
-func (r *Runner) runCase(ctx context.Context, runID string, suite Suite, variant Variant, evalCase Case) []CaseResult {
+func (r *Runner) runCase(
+	ctx context.Context,
+	runID string,
+	suite Suite,
+	variant Variant,
+	evalCase Case,
+	expected InputDigest,
+) []CaseResult {
 	prompt, err := suite.PromptText(evalCase)
 	if err != nil {
 		return []CaseResult{failedCase(evalCase.ID, variant.ID, 1, err)}
 	}
-	fixture, err := suite.FixturePath(evalCase)
+	if expected.CaseID != evalCase.ID || digestBytes([]byte(prompt)) != expected.PromptSHA256 {
+		return []CaseResult{failedCase(
+			evalCase.ID,
+			variant.ID,
+			1,
+			errors.New("evaluation: prompt changed after run identity was fixed"),
+		)}
+	}
+	fixture, err := suite.openFixture(evalCase)
 	if err != nil {
 		return []CaseResult{failedCase(evalCase.ID, variant.ID, 1, err)}
 	}
+	defer fixture.Close()
 	results := make([]CaseResult, 0, suite.Defaults.Retries+1)
 	for attempt := 1; attempt <= suite.Defaults.Retries+1; attempt++ {
 		startedAt := time.Now().UTC()
@@ -343,6 +375,34 @@ func (r *Runner) runCase(ctx context.Context, runID string, suite Suite, variant
 			results = append(results, failedCase(evalCase.ID, variant.ID, attempt, err))
 			break
 		}
+		fixtureRoot, err := os.OpenRoot(workspaceDir)
+		if err != nil {
+			results = append(results, failedCase(evalCase.ID, variant.ID, attempt, err))
+			break
+		}
+		fixtureDigest, digestErr := digestFixture(ctx, fixtureRoot)
+		closeErr := fixtureRoot.Close()
+		if err := errors.Join(digestErr, closeErr); err != nil {
+			results = append(results, failedCase(evalCase.ID, variant.ID, attempt, err))
+			break
+		}
+		if fixtureDigest != expected.FixtureSHA256 {
+			results = append(results, failedCase(
+				evalCase.ID,
+				variant.ID,
+				attempt,
+				errors.New("evaluation: fixture changed after run identity was fixed"),
+			))
+			break
+		}
+		// Capture the baseline from the exact bytes copied into this attempt,
+		// rather than reading the source fixture a second time across a mutable
+		// filesystem boundary.
+		baseline, err := snapshotFiles(ctx, workspaceDir)
+		if err != nil {
+			results = append(results, failedCase(evalCase.ID, variant.ID, attempt, err))
+			break
+		}
 		caseCtx, cancel := context.WithTimeout(ctx, time.Duration(suite.Defaults.TimeoutMS)*time.Millisecond)
 		agentResult, runErr := r.agent.Run(caseCtx, AgentRequest{
 			RunID: runID, CaseID: evalCase.ID, Variant: variant, Attempt: attempt,
@@ -352,7 +412,7 @@ func (r *Runner) runCase(ctx context.Context, runID string, suite Suite, variant
 			AllowedCommands: append([]string(nil), suite.Defaults.AllowedCommands...),
 		})
 		grades, passed, score, gradeErr := Grade(caseCtx, GradeInput{
-			WorkspaceDir: workspaceDir, BaselineDir: fixture,
+			WorkspaceDir: workspaceDir, BaselineFiles: baseline,
 			SafetyViolations: agentResult.Usage.SafetyViolations,
 			Prompt:           prompt, FinalOutput: agentResult.FinalOutput,
 			JudgeConfig: suite.Defaults.Judge, Judge: r.judge,
@@ -428,7 +488,7 @@ func selectVariants(all []Variant, selected []string) ([]Variant, error) {
 	return variants, nil
 }
 
-func suiteDigest(suite Suite, variants []Variant) (string, Reproducibility, error) {
+func suiteDigest(ctx context.Context, suite Suite, variants []Variant) (string, Reproducibility, error) {
 	reproducibility := Reproducibility{
 		CoreVersion: plugin.CoreVersion,
 		GoVersion:   runtime.Version(),
@@ -443,13 +503,17 @@ func suiteDigest(suite Suite, variants []Variant) (string, Reproducibility, erro
 		if err != nil {
 			return "", Reproducibility{}, err
 		}
-		fixture, err := suite.FixturePath(evalCase)
+		fixture, err := suite.openFixture(evalCase)
 		if err != nil {
 			return "", Reproducibility{}, err
 		}
-		fixtureSHA256, err := digestFixture(fixture)
+		fixtureSHA256, err := digestFixture(ctx, fixture)
+		closeErr := fixture.Close()
 		if err != nil {
 			return "", Reproducibility{}, err
+		}
+		if closeErr != nil {
+			return "", Reproducibility{}, fmt.Errorf("evaluation: closing fixture: %w", closeErr)
 		}
 		reproducibility.Inputs = append(reproducibility.Inputs, InputDigest{
 			CaseID:        evalCase.ID,
@@ -472,50 +536,51 @@ func suiteDigest(suite Suite, variants []Variant) (string, Reproducibility, erro
 	return "sha256:" + hex.EncodeToString(sum[:]), reproducibility, nil
 }
 
-func digestFixture(root string) (string, error) {
+func digestFixture(ctx context.Context, root *os.Root) (string, error) {
+	return digestFixtureWithLimits(ctx, root, 10_000, 512<<20)
+}
+
+func digestFixtureWithLimits(ctx context.Context, root *os.Root, maxFiles int, maxBytes int64) (string, error) {
+	if root == nil {
+		return "", errors.New("evaluation: fixture root is unavailable")
+	}
 	type entryDigest struct {
 		Path   string `json:"path"`
 		SHA256 string `json:"sha256"`
 	}
 	entries := make([]entryDigest, 0)
 	var total int64
-	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		relative, err := filepath.Rel(root, name)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if relative == "." || entry.IsDir() {
+		if name == "." || entry.IsDir() {
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
-			return fmt.Errorf("evaluation: fixture contains non-regular file %q", relative)
+			return fmt.Errorf("evaluation: fixture contains non-regular file %q", name)
 		}
-		if len(entries) >= 10_000 {
+		if len(entries) >= maxFiles {
 			return errors.New("evaluation: fixture digest file limit exceeded")
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		total += info.Size()
-		if total > 512<<20 {
-			return errors.New("evaluation: fixture digest byte limit exceeded")
-		}
-		file, err := os.Open(name)
-		if err != nil {
-			return err
+		local := filepath.FromSlash(name)
+		if !filepath.IsLocal(local) {
+			return fmt.Errorf("evaluation: fixture path %q is not local", name)
 		}
 		hash := sha256.New()
-		_, copyErr := io.Copy(hash, file)
-		closeErr := file.Close()
-		if err := errors.Join(copyErr, closeErr); err != nil {
+		copied, _, err := readRootFile(ctx, root, local, maxBytes-total, hash)
+		total += copied
+		if errors.Is(err, errFileByteLimit) {
+			return errors.New("evaluation: fixture digest byte limit exceeded")
+		}
+		if err != nil {
 			return err
 		}
 		entries = append(entries, entryDigest{
-			Path: filepath.ToSlash(relative), SHA256: "sha256:" + hex.EncodeToString(hash.Sum(nil)),
+			Path: name, SHA256: "sha256:" + hex.EncodeToString(hash.Sum(nil)),
 		})
 		return nil
 	})

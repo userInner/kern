@@ -8,8 +8,8 @@ and what still blocks a public security claim.
 
 | Boundary | Enforcement | Automated evidence |
 |---|---|---|
-| Local HTTP session | Random token, constant-time comparison, loopback-only first-release binding | `TestServerRejectsUnauthenticatedAPI`, CLI unsafe-listener rejection tests |
-| Browser mutation requests | Strict same-site HttpOnly cookie plus Origin validation; bearer clients authenticate explicitly | HTTP mutation and origin tests |
+| Local browser session | Persistent API token remains server-side; signed short-lived browser bearer token; constant-time verification; HTTP and HTTPS require loopback Host and peer with matching TLS mode | HTTP bootstrap, expiry, transport, authentication and unsafe-listener rejection tests |
+| Browser mutation requests | No authentication cookies; strict Origin validation for browser requests; explicit bearer authentication for browser and API clients | HTTP mutation, bootstrap and origin tests |
 | Web rendering | React text rendering, strict CSP, no external script/style origins, framing denied | Web build, unit tests, HTTP header tests |
 | Workspace | Root-relative handles, traversal/symlink/sensitive-path rejection, atomic writes and expected-hash checks | workspace confinement and atomic-write tests |
 | Tool authorization | Core classifies effect/risk, persists the exact input hash, waits for a scoped approval receipt, and rechecks before execution | authorization manager, approval receipt, expiry, cancellation, and unapproved-side-effect tests |
@@ -63,6 +63,11 @@ These items remain incomplete and must not be described as implemented:
    independent assurance. No independent audit or supported-OS penetration
    test has been completed, and the scheduled hosted campaign cannot be
    evidenced until the repository is pushed.
+6. **Hostile same-user processes.** The loopback HTML bootstrap prevents remote
+   web origins from reading its bearer token, but it is not an operating-system
+   authentication boundary against another process already running as the same
+   user. Deployments with that threat model need a dedicated OS account or a
+   future native pairing/IPC channel.
 
 ## Public-release gates
 

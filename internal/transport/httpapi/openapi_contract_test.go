@@ -97,7 +97,7 @@ func openAPIContractSymbols(t *testing.T, content []byte) (map[string]int, map[s
 	return operationIDs, definitions
 }
 
-func TestEveryCookieAuthenticatedMutationHasOriginGate(t *testing.T) {
+func TestEveryBearerAuthenticatedMutationRejectsAnUntrustedOrigin(t *testing.T) {
 	t.Parallel()
 	server := &Server{token: "session-secret"}
 	for _, route := range server.apiRoutes() {
@@ -108,7 +108,8 @@ func TestEveryCookieAuthenticatedMutationHasOriginGate(t *testing.T) {
 		t.Run(contractRoute(route.method, route.path), func(t *testing.T) {
 			t.Parallel()
 			request := httptest.NewRequest(route.method, "/", nil)
-			request.AddCookie(&http.Cookie{Name: sessionCookie, Value: "session-secret"})
+			request.Header.Set("Authorization", "Bearer session-secret")
+			request.Header.Set("Origin", "https://attacker.example")
 			response := httptest.NewRecorder()
 			route.handler.ServeHTTP(response, request)
 			if response.Code != http.StatusForbidden {

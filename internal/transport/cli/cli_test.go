@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +56,28 @@ func TestAttachProductionAdaptersToBudgetConfig(t *testing.T) {
 	attachProductionAdapters(&config)
 	if config.SecretVault == nil || config.WASMSandbox == nil {
 		t.Fatalf("production adapters missing: %#v", config)
+	}
+}
+
+func TestLoopbackWebURLUsesActualBoundAddressAndPort(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	url, err := loopbackWebURL(listener)
+	if err != nil {
+		t.Fatalf("loopbackWebURL() error = %v", err)
+	}
+	if !strings.HasPrefix(url, "http://127.0.0.1:") || strings.HasSuffix(url, ":0") {
+		t.Fatalf("loopbackWebURL() = %q", url)
+	}
+}
+
+func TestLoopbackWebURLRejectsNonLoopbackBoundAddress(t *testing.T) {
+	listener := fixedListener{addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 8787}}
+	if _, err := loopbackWebURL(listener); err == nil || !strings.Contains(err.Error(), "not loopback") {
+		t.Fatalf("loopbackWebURL(non-loopback) error = %v", err)
 	}
 }
 
@@ -456,4 +480,20 @@ func createCLIPluginPackage(t *testing.T) string {
 		t.Fatalf("WriteFile(manifest) error = %v", err)
 	}
 	return directory
+}
+
+type fixedListener struct {
+	addr net.Addr
+}
+
+func (l fixedListener) Accept() (net.Conn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (l fixedListener) Close() error {
+	return nil
+}
+
+func (l fixedListener) Addr() net.Addr {
+	return l.addr
 }

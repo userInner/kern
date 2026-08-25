@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,6 +114,89 @@ func TestRuntimeClosesWhenHostContextIsCancelled(t *testing.T) {
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestRuntimeCloseStopsLiveEventStreamWithoutGraceTimeout(t *testing.T) {
+	t.Setenv("KERN_MODEL_BASE_URL", "")
+	t.Setenv("KERN_MODEL", "")
+	runtime, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:      t.TempDir(),
+		WorkspaceDir: t.TempDir(),
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	created, err := runtime.Client().CreateTask(t.Context(), kern.CreateTaskInput{Goal: "open a shutdown stream"})
+	if err != nil {
+		_ = runtime.Close()
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	stream, err := runtime.Client().OpenEventStream(context.Background(), created.ID, 0)
+	if err != nil {
+		_ = runtime.Close()
+		t.Fatalf("OpenEventStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	started := time.Now()
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Close() took %s with a live event stream", elapsed)
+	}
+	for range 100 {
+		if _, err := stream.Next(); err != nil {
+			return
+		}
+	}
+	t.Fatal("event stream did not reach EOF after runtime shutdown")
+}
+
+func TestRuntimeDisablesEvaluationWithoutTrustedRoot(t *testing.T) {
+	runtime, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:      t.TempDir(),
+		WorkspaceDir: t.TempDir(),
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer runtime.Close()
+
+	_, err = runtime.Client().StartEvaluation(t.Context(), kern.StartEvaluationInput{SuitePath: "suite"})
+	var apiErr *kern.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(apiErr.Message, "evaluation root is not configured") {
+		t.Fatalf("StartEvaluation() error = %#v", err)
+	}
+}
+
+func TestRuntimeRejectsEvaluationStorageOverlappingAgentWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	_, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:        filepath.Join(workspace, "kern-data"),
+		WorkspaceDir:   workspace,
+		EvaluationRoot: t.TempDir(),
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "data root and writable agent roots must not overlap") {
+		t.Fatalf("Open(overlapping evaluation storage) error = %v", err)
+	}
+}
+
+func TestRuntimeRejectsEvaluationRootOverlappingAgentWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	_, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:        t.TempDir(),
+		WorkspaceDir:   workspace,
+		EvaluationRoot: workspace,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "evaluation root and writable agent roots must not overlap") {
+		t.Fatalf("Open(overlapping evaluation root) error = %v", err)
 	}
 }
 

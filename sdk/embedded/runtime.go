@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,8 +32,11 @@ const shutdownTimeout = 5 * time.Second
 // Config controls one embedded runtime. DataDir is required; every other zero
 // value receives the same bounded default used by the standalone Core.
 type Config struct {
-	DataDir              string
-	WorkspaceDir         string
+	DataDir      string
+	WorkspaceDir string
+	// EvaluationRoot optionally enables evaluations for suites below this
+	// trusted directory. It must not overlap WorkspaceDir or evaluation data.
+	EvaluationRoot       string
 	WorkerCount          int
 	MaxTurns             int
 	MaxToolCalls         int
@@ -53,15 +57,17 @@ type Config struct {
 // Runtime owns an in-process Core, a loopback-only transport, and its typed
 // client. Close must be called when the host no longer needs the runtime.
 type Runtime struct {
-	core      *app.Runtime
-	evals     *evalservice.Service
-	server    *http.Server
-	listener  net.Listener
-	client    *kern.Client
-	baseURL   string
-	errors    chan error
-	serveDone chan struct{}
-	closed    chan struct{}
+	core             *app.Runtime
+	evals            *evalservice.Service
+	handler          *httpapi.Server
+	server           *http.Server
+	listener         net.Listener
+	pluginImportRoot *os.Root
+	client           *kern.Client
+	baseURL          string
+	errors           chan error
+	serveDone        chan struct{}
+	closed           chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -124,16 +130,30 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 			_ = core.Close()
 		}
 	}()
+	workspaceRoot := core.Workspace.Root()
+	pluginImportRoot, err := os.OpenRoot(workspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("embedded: opening plugin import root: %w", err)
+	}
+	cleanupPluginImportRoot := true
+	defer func() {
+		if cleanupPluginImportRoot {
+			_ = pluginImportRoot.Close()
+		}
+	}()
 
 	maxActiveEvals := config.MaxActiveEvaluations
 	if maxActiveEvals < 1 {
 		maxActiveEvals = 1
 	}
 	evals, err := evalservice.New(ctx, evalservice.Config{
-		DataRoot:  filepath.Join(config.DataDir, "evals"),
-		Store:     core.Store,
-		MaxActive: maxActiveEvals,
-		MaxTurns:  config.MaxTurns, MaxToolCalls: config.MaxToolCalls,
+		DataRoot:       filepath.Join(config.DataDir, "evals"),
+		EvalRoot:       strings.TrimSpace(config.EvaluationRoot),
+		WritableRoots:  []string{workspaceRoot},
+		Store:          core.Store,
+		PluginResolver: core.Plugins,
+		MaxActive:      maxActiveEvals,
+		MaxTurns:       config.MaxTurns, MaxToolCalls: config.MaxToolCalls,
 		Logger: logger,
 	})
 	if err != nil {
@@ -150,21 +170,6 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	handler, err := httpapi.New(httpapi.Config{
-		Store:          core.Store,
-		Artifacts:      core.Artifacts,
-		Submitter:      core,
-		Models:         core,
-		Plugins:        core.Plugins,
-		Evals:          evals,
-		MetricsEnabled: config.MetricsEnabled,
-		Token:          token,
-		Mode:           core.Mode,
-		Logger:         logger,
-	})
-	if err != nil {
-		return nil, err
-	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("embedded: opening loopback listener: %w", err)
@@ -176,6 +181,24 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		}
 	}()
 	baseURL := "http://" + listener.Addr().String()
+	handler, err := httpapi.New(httpapi.Config{
+		Store:                  core.Store,
+		Artifacts:              core.Artifacts,
+		Submitter:              core,
+		Models:                 core,
+		Plugins:                core.Plugins,
+		Evals:                  evals,
+		MetricsEnabled:         config.MetricsEnabled,
+		Token:                  token,
+		Mode:                   core.Mode,
+		Logger:                 logger,
+		PluginImportRoot:       pluginImportRoot,
+		Origin:                 baseURL,
+		AllowPlainHTTPLoopback: true,
+	})
+	if err != nil {
+		return nil, err
+	}
 	client, err := kern.NewClient(kern.Config{BaseURL: baseURL, Token: token})
 	if err != nil {
 		return nil, err
@@ -188,8 +211,9 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		IdleTimeout:       60 * time.Second,
 	}
 	runtime := &Runtime{
-		core: core, evals: evals, server: server, listener: listener,
-		client: client, baseURL: baseURL,
+		core: core, evals: evals, handler: handler, server: server, listener: listener,
+		pluginImportRoot: pluginImportRoot,
+		client:           client, baseURL: baseURL,
 		errors: make(chan error, 1), serveDone: make(chan struct{}), closed: make(chan struct{}),
 	}
 	go runtime.serve()
@@ -203,6 +227,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 	cleanupCore = false
 	cleanupEvals = false
 	cleanupListener = false
+	cleanupPluginImportRoot = false
 	return runtime, nil
 }
 
@@ -269,16 +294,19 @@ func (r *Runtime) Close() error {
 		return nil
 	}
 	r.closeOnce.Do(func() {
+		r.handler.BeginShutdown()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
 		serverErr := r.server.Shutdown(shutdownCtx)
+		cancel()
 		if errors.Is(serverErr, context.DeadlineExceeded) {
 			serverErr = r.server.Close()
 		}
+		idleErr := r.handler.WaitForIdle(context.Background())
 		r.evals.Close()
+		pluginRootErr := r.pluginImportRoot.Close()
 		coreErr := r.core.Close()
 		<-r.serveDone
-		r.closeErr = errors.Join(serverErr, coreErr)
+		r.closeErr = errors.Join(serverErr, idleErr, pluginRootErr, coreErr)
 		close(r.closed)
 	})
 	return r.closeErr
