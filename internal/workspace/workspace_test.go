@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -131,7 +132,7 @@ func TestWorkspaceMoveRequiresCurrentHashAndAbsentDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(destination) error = %v", err)
 	}
-	if info.Mode().Perm() != 0o640 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
 		t.Fatalf("destination mode = %v, want 0640", info.Mode().Perm())
 	}
 }

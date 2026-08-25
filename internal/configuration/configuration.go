@@ -317,13 +317,7 @@ func Save(path string, config File) error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("configuration: restricting file: %w", err)
 	}
-	dir, err := os.Open(directory)
-	if err != nil {
-		return fmt.Errorf("configuration: opening directory for sync: %w", err)
-	}
-	syncErr = dir.Sync()
-	closeErr = dir.Close()
-	if err := errors.Join(syncErr, closeErr); err != nil {
+	if err := syncDirectory(directory); err != nil {
 		return fmt.Errorf("configuration: syncing directory: %w", err)
 	}
 	return nil

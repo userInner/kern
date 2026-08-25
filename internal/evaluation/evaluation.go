@@ -372,18 +372,21 @@ func safeExecutable(value string) bool {
 }
 
 func safeRelative(value string) bool {
-	if value == "" || filepath.IsAbs(value) || strings.ContainsRune(value, 0) {
+	// Suite files use slash-separated paths as their portable wire format.
+	// filepath.Clean rewrites those separators on Windows, so validating the
+	// serialized value with filepath would reject every nested path there.
+	if value == "" || strings.ContainsAny(value, `\:`+"\x00") || path.IsAbs(value) {
 		return false
 	}
-	clean := filepath.Clean(value)
-	return clean == value && clean != "." && clean != ".." && !strings.HasPrefix(clean, ".."+string(filepath.Separator))
+	clean := path.Clean(value)
+	return clean == value && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
 }
 
 func resolveWithin(root, relative string) (string, error) {
 	if !safeRelative(relative) {
 		return "", fmt.Errorf("%w: unsafe relative path %q", ErrInvalidSuite, relative)
 	}
-	name := filepath.Join(root, relative)
+	name := filepath.Join(root, filepath.FromSlash(relative))
 	rel, err := filepath.Rel(root, name)
 	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: path escapes suite root", ErrInvalidSuite)

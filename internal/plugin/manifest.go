@@ -168,7 +168,7 @@ func ValidateManifest(manifest Manifest) error {
 		}
 	}
 	for _, executable := range manifest.Permissions.Process {
-		if strings.TrimSpace(executable) == "" || strings.ContainsAny(executable, `/\\\x00`) {
+		if strings.TrimSpace(executable) == "" || strings.ContainsAny(executable, "/\\\x00") {
 			return fmt.Errorf("%w: invalid process permission %q", ErrInvalidManifest, executable)
 		}
 	}

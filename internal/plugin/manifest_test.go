@@ -64,6 +64,35 @@ func TestValidateManifestRejectsTraversalAndIncompatibility(t *testing.T) {
 	}
 }
 
+func TestValidateManifestProcessPermissions(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		executable string
+		wantError  bool
+	}{
+		{name: "Windows executable suffix", executable: "app.test.exe"},
+		{name: "digit in executable", executable: "tool0"},
+		{name: "slash", executable: "bin/tool", wantError: true},
+		{name: "backslash", executable: `bin\tool`, wantError: true},
+		{name: "NUL", executable: "tool\x00name", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := validManifest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+			manifest.Permissions.Process = []string{test.executable}
+			err := ValidateManifest(manifest)
+			if test.wantError && !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("ValidateManifest() error = %v, want ErrInvalidManifest", err)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("ValidateManifest() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadManifestRejectsUnknownFields(t *testing.T) {
 	directory := t.TempDir()
 	manifest := `{

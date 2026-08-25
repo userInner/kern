@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -111,7 +112,11 @@ func main() {
 	if err := os.WriteFile(name, []byte(source), 0o600); err != nil {
 		t.Fatalf("WriteFile(helper) error = %v", err)
 	}
-	executable := filepath.Join(root, "codex-test")
+	executableName := "codex-test"
+	if runtime.GOOS == "windows" {
+		executableName += ".exe"
+	}
+	executable := filepath.Join(root, executableName)
 	command := exec.Command("go", "build", "-o", executable, name)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("go build helper: %v: %s", err, output)

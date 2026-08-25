@@ -38,10 +38,41 @@ func TestOpenAPIOperationIDsAndSchemaReferencesAreComplete(t *testing.T) {
 	t.Parallel()
 
 	content := readOpenAPIContent(t)
+	operationIDs, definitions := openAPIContractSymbols(t, content)
+	if len(operationIDs) == 0 || len(definitions) == 0 {
+		t.Fatalf("OpenAPI contract is incomplete: operations=%d schemas=%d", len(operationIDs), len(definitions))
+	}
+	for _, match := range schemaReferencePattern.FindAllSubmatch(content, -1) {
+		name := string(match[1])
+		if _, exists := definitions[name]; !exists {
+			t.Fatalf("OpenAPI references undefined schema %q", name)
+		}
+	}
+}
+
+func TestOpenAPIContractSymbolsAcceptCRLF(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("paths:\r\n  /health:\r\n    get:\r\n      operationId: getHealth\r\ncomponents:\r\n  schemas:\r\n    Health:\r\n      type: object\r\n")
+	operationIDs, definitions := openAPIContractSymbols(t, content)
+	if operationIDs["getHealth"] == 0 {
+		t.Fatal("operationId getHealth was not found")
+	}
+	if _, exists := definitions["Health"]; !exists {
+		t.Fatal("schema Health was not found")
+	}
+}
+
+func openAPIContractSymbols(t *testing.T, content []byte) (map[string]int, map[string]struct{}) {
+	t.Helper()
+
 	operationIDs := make(map[string]int)
 	definitions := make(map[string]struct{})
 	inSchemas := false
-	for lineNumber, line := range strings.Split(string(content), "\n") {
+	// Git may materialize text files with CRLF on Windows. The OpenAPI
+	// contract's indentation is significant to this lightweight parser, but
+	// its line-ending representation is not.
+	for lineNumber, line := range strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "operationId:") {
 			operationID := strings.TrimSpace(strings.TrimPrefix(trimmed, "operationId:"))
@@ -63,15 +94,7 @@ func TestOpenAPIOperationIDsAndSchemaReferencesAreComplete(t *testing.T) {
 			definitions[name] = struct{}{}
 		}
 	}
-	if len(operationIDs) == 0 || len(definitions) == 0 {
-		t.Fatalf("OpenAPI contract is incomplete: operations=%d schemas=%d", len(operationIDs), len(definitions))
-	}
-	for _, match := range schemaReferencePattern.FindAllSubmatch(content, -1) {
-		name := string(match[1])
-		if _, exists := definitions[name]; !exists {
-			t.Fatalf("OpenAPI references undefined schema %q", name)
-		}
-	}
+	return operationIDs, definitions
 }
 
 func TestEveryCookieAuthenticatedMutationHasOriginGate(t *testing.T) {

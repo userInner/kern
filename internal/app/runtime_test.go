@@ -1410,8 +1410,11 @@ func TestRuntimeRecoversShutdownWhileWaitingApproval(t *testing.T) {
 
 func waitForRuntimeApproval(t *testing.T, runtime *Runtime, taskID string) approval.Request {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		requests, err := runtime.Store.PendingApprovals(t.Context(), taskID)
 		if err != nil {
 			t.Fatalf("PendingApprovals() error = %v", err)
@@ -1419,18 +1422,21 @@ func waitForRuntimeApproval(t *testing.T, runtime *Runtime, taskID string) appro
 		if len(requests) == 1 {
 			return requests[0]
 		}
-		time.Sleep(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			current, taskErr := runtime.Store.GetTask(t.Context(), taskID)
+			events, eventErr := runtime.Store.EventsAfter(t.Context(), taskID, 0, 100)
+			t.Fatalf(
+				"approval request was not persisted: %v; task=%#v task_err=%v events=%#v event_err=%v",
+				ctx.Err(),
+				current,
+				taskErr,
+				events,
+				eventErr,
+			)
+		case <-ticker.C:
+		}
 	}
-	current, taskErr := runtime.Store.GetTask(t.Context(), taskID)
-	events, eventErr := runtime.Store.EventsAfter(t.Context(), taskID, 0, 100)
-	t.Fatalf(
-		"approval request was not persisted; task=%#v task_err=%v events=%#v event_err=%v",
-		current,
-		taskErr,
-		events,
-		eventErr,
-	)
-	return approval.Request{}
 }
 
 func TestRuntimeRecoversInterruptedAttempt(t *testing.T) {

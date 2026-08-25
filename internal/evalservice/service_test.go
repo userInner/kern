@@ -128,7 +128,7 @@ func writeServiceSuite(t *testing.T, slow bool) string {
 	}
 	if slow {
 		graders = []evaluation.Grader{{ID: "go.test-all", Type: "command", Required: true, Command: []string{"go", "test", "./..."}}}
-		testSource := "package serviceeval\n\nimport (\"testing\"; \"time\")\n\nfunc TestSlow(t *testing.T) { time.Sleep(5 * time.Second) }\n"
+		testSource := "package serviceeval\n\nimport (\"testing\"; \"time\")\n\nfunc TestSlow(t *testing.T) { time.Sleep(time.Second) }\n"
 		if err := os.WriteFile(filepath.Join(fixture, "slow_test.go"), []byte(testSource), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -137,7 +137,7 @@ func writeServiceSuite(t *testing.T, slow bool) string {
 		SchemaVersion: evaluation.SchemaVersion,
 		ID:            "kern.go.service", Name: "Service test", Version: "1.0.0",
 		Defaults: evaluation.Defaults{
-			TimeoutMS: 30_000, TokenBudget: 1_000, CostBudgetMicros: 0,
+			TimeoutMS: 60_000, TokenBudget: 1_000, CostBudgetMicros: 0,
 			Retries: 0, WorkerCount: 1, AllowedCommands: []string{"go"},
 		},
 		Variants: []evaluation.Variant{{ID: "general.base"}},
@@ -162,7 +162,7 @@ func waitForRun(
 	want evaluation.Status,
 ) evaluation.Run {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()

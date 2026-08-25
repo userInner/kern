@@ -60,6 +60,29 @@ func TestShippedGoReferenceSuite(t *testing.T) {
 	}
 }
 
+func TestSuitePathsUsePortableSlashSeparators(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "nested path", path: "fixtures/example/main.go", want: true},
+		{name: "backslash", path: `fixtures\example\main.go`, want: false},
+		{name: "drive-qualified", path: "C:/example/main.go", want: false},
+		{name: "traversal", path: "../example/main.go", want: false},
+		{name: "cleaned traversal", path: "fixtures/../main.go", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := safeRelative(test.path); got != test.want {
+				t.Fatalf("safeRelative(%q) = %t, want %t", test.path, got, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsUnsafeOrAmbiguousSuites(t *testing.T) {
 	tests := []struct {
 		name   string

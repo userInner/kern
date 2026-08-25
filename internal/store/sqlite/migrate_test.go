@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -126,7 +127,7 @@ CREATE UNIQUE INDEX idx_attempts_one_active ON attempts(task_id) WHERE finished_
 	if err != nil {
 		t.Fatalf("Stat(pre-migration backup) error = %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("pre-migration backup permissions = %o, want 600", got)
 	}
 	backup, err := sql.Open("sqlite", "file:"+filepath.ToSlash(backups[0])+"?mode=ro")
