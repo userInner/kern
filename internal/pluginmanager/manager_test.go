@@ -27,6 +27,7 @@ func TestManagerInstallEnableDisableRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	source := createPluginPackage(t, "dev.kern.test")
 	installed, created, err := manager.Install(t.Context(), source)
 	if err != nil || !created || installed.Enabled {
@@ -73,6 +74,7 @@ func TestManagerCloseIsIdempotentAndRejectsFurtherOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	source := createPluginPackage(t, "dev.kern.closed")
 	importRoot := openTestRoot(t, t.TempDir())
 
@@ -122,6 +124,7 @@ func TestManagerCloseWaitsForActiveOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	if err := manager.beginOperation(); err != nil {
 		t.Fatalf("beginOperation() error = %v", err)
 	}
@@ -156,6 +159,7 @@ func TestManagerConcurrentClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 
 	var wait sync.WaitGroup
 	errorsSeen := make(chan error, 16)
@@ -185,6 +189,7 @@ func TestManagerRefusesToEnableTamperedInstalledPackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	installed, _, err := manager.Install(t.Context(), createPluginPackage(t, "dev.kern.tamper"))
 	if err != nil {
 		t.Fatalf("Install() error = %v", err)
@@ -211,6 +216,7 @@ func TestManagerInstallFromRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	imports := t.TempDir()
 	source := filepath.Join(imports, "packages", "go")
 	writePluginPackage(t, source, "dev.kern.rooted")
@@ -244,6 +250,7 @@ func TestManagerInstallFromRootRejectsUnsafePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	importRoot, err := os.OpenRoot(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenRoot(imports) error = %v", err)
@@ -277,6 +284,7 @@ func TestManagerInstallFromRootClassifiesInvalidPackages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	imports := t.TempDir()
 	if err := os.Mkdir(filepath.Join(imports, "missing-manifest"), 0o700); err != nil {
 		t.Fatalf("Mkdir() error = %v", err)
@@ -304,6 +312,7 @@ func TestManagerInstallFromRootRejectsSymbolicLinkSources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	imports := t.TempDir()
 	importRoot, err := os.OpenRoot(imports)
 	if err != nil {
@@ -369,6 +378,7 @@ func TestManagerRejectsStorageAndSourceOverlap(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
+			t.Cleanup(func() { _ = manager.Close() })
 			writePluginPackage(t, source, "dev.kern.overlap")
 			if _, _, err := manager.Install(t.Context(), source); err == nil || !strings.Contains(err.Error(), "overlap") {
 				t.Fatalf("Install(overlap) error = %v, want overlap rejection", err)
@@ -394,6 +404,7 @@ func TestManagerRejectsStorageAndSourceOverlap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
+		t.Cleanup(func() { _ = manager.Close() })
 		writePluginPackage(t, storage, "dev.kern.alias-overlap")
 		alias := filepath.Join(t.TempDir(), "alias")
 		if err := os.Symlink(storage, alias); err != nil {
@@ -416,6 +427,7 @@ func TestManagerRejectsStorageAndSourceOverlap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
+		t.Cleanup(func() { _ = manager.Close() })
 		source := filepath.Join(base, "plugins", "source")
 		if err := os.MkdirAll(source, 0o700); err != nil {
 			t.Fatalf("MkdirAll(case-folded source) error = %v", err)
@@ -447,6 +459,7 @@ func TestManagerInstallFromRootRejectsStorageOverlap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
+		t.Cleanup(func() { _ = manager.Close() })
 		writePluginPackage(t, storage, "dev.kern.rooted-overlap")
 		importRoot, err := os.OpenRoot(imports)
 		if err != nil {
@@ -471,6 +484,7 @@ func TestManagerInstallFromRootRejectsStorageOverlap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
+		t.Cleanup(func() { _ = manager.Close() })
 		writePluginPackage(t, storage, "dev.kern.rooted-alias-overlap")
 		alias := filepath.Join(t.TempDir(), "alias")
 		if err := os.Symlink(storage, alias); err != nil {
@@ -503,6 +517,7 @@ func TestManagerRejectsReplacedStorageRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	moved := filepath.Join(base, "plugins-moved")
 	if err := os.Rename(storage, moved); err != nil {
 		t.Skipf("platform does not permit renaming an open directory: %v", err)
@@ -537,6 +552,7 @@ func TestManagerRejectsSymlinkedDestinationParent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(storage, "dev.kern.destination-link")); err != nil {
 		t.Skipf("Symlink() unavailable: %v", err)
@@ -568,6 +584,7 @@ func TestManagerRejectsPublishedManifestMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	source := createPluginPackage(t, "dev.kern.manifest-race")
 	manifest, _, err := plugin.LoadManifest(source)
 	if err != nil {

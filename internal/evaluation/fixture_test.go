@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -33,7 +34,14 @@ func TestCopyFixtureUsesConfinedRootHandles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o700 {
+	if runtime.GOOS == "windows" {
+		// Windows reports synthesized rw bits for regular files and does not
+		// expose owner/group/other ACL separation through FileMode. Still verify
+		// that copying did not introduce executable permission bits.
+		if info.Mode().Perm()&0o111 != 0 {
+			t.Fatalf("copied file mode = %v, want no executable bits", info.Mode().Perm())
+		}
+	} else if info.Mode().Perm() != 0o700 {
 		t.Fatalf("copied file mode = %v, want 0700", info.Mode().Perm())
 	}
 }

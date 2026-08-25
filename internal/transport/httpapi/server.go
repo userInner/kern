@@ -1607,6 +1607,8 @@ func (s *Server) writeModelConfigError(w http.ResponseWriter, r *http.Request, e
 		writeProblem(w, http.StatusServiceUnavailable, "system credential store became unavailable")
 	case errors.Is(err, secret.ErrTooLarge):
 		writeProblem(w, http.StatusBadRequest, "API key exceeds the portable system credential limit")
+	case errors.Is(err, modelconfig.ErrInvalid):
+		writeProblem(w, http.StatusBadRequest, "invalid model config")
 	case errors.Is(err, modelconfig.ErrNotFound):
 		writeProblem(w, http.StatusNotFound, "model config not found")
 	case errors.Is(err, modelconfig.ErrConflict):

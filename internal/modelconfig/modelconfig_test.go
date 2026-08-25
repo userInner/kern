@@ -2,6 +2,7 @@ package modelconfig
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -41,7 +42,25 @@ func TestNormalizeRejectsUnsafeBaseURL(t *testing.T) {
 			if err == nil {
 				t.Fatal("Normalize() error = nil")
 			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("errors.Is(%v, ErrInvalid) = false", err)
+			}
 		})
+	}
+}
+
+func TestNormalizeInvalidDraftRetainsLocalDetail(t *testing.T) {
+	_, err := Normalize(Draft{
+		Name:     "model",
+		Provider: ProviderOpenAICompatible,
+		BaseURL:  "https://user:secret@example.com",
+		Model:    "test",
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("errors.Is(%v, ErrInvalid) = false", err)
+	}
+	if !strings.Contains(err.Error(), "base url must not include credentials") {
+		t.Fatalf("Normalize() error = %q, want local validation detail", err)
 	}
 }
 

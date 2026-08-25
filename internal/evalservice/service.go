@@ -370,9 +370,12 @@ func (s *Service) Resume(ctx context.Context, runID string) (evaluation.Run, err
 	}
 	current.Status = evaluation.StatusQueued
 	current.ErrorMessage = ""
+	current.CompletedAt = nil
 	s.launch(current, suite, config.Variants, runner, prior)
 	closeSnapshot = false
-	return s.store.GetEvalRun(ctx, runID)
+	// Resume admits asynchronous work just like Start. Return that stable queued
+	// snapshot instead of racing the worker with another store read.
+	return current, nil
 }
 
 // Cancel requests cancellation and returns the latest durable snapshot.

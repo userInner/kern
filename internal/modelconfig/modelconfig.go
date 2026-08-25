@@ -16,6 +16,7 @@ var (
 	ErrNotFound = errors.New("modelconfig: not found")
 	ErrConflict = errors.New("modelconfig: name already exists")
 	ErrDisabled = errors.New("modelconfig: disabled")
+	ErrInvalid  = errors.New("modelconfig: invalid")
 )
 
 // Provider identifies a supported model connection protocol.
@@ -87,19 +88,19 @@ func Normalize(draft Draft) (Draft, error) {
 	draft.Model = strings.TrimSpace(draft.Model)
 	draft.SecretRef = strings.TrimSpace(draft.SecretRef)
 	if draft.Name == "" || len([]rune(draft.Name)) > 100 {
-		return Draft{}, errors.New("modelconfig: name must contain 1 to 100 characters")
+		return Draft{}, fmt.Errorf("%w: name must contain 1 to 100 characters", ErrInvalid)
 	}
 	if draft.Provider != ProviderOpenAICompatible && draft.Provider != ProviderOllama {
-		return Draft{}, fmt.Errorf("modelconfig: unsupported provider %q", draft.Provider)
+		return Draft{}, fmt.Errorf("%w: unsupported provider %q", ErrInvalid, draft.Provider)
 	}
 	if draft.Model == "" || len(draft.Model) > 256 {
-		return Draft{}, errors.New("modelconfig: model must contain 1 to 256 bytes")
+		return Draft{}, fmt.Errorf("%w: model must contain 1 to 256 bytes", ErrInvalid)
 	}
 	if len(draft.SecretRef) > 512 {
-		return Draft{}, errors.New("modelconfig: secret reference exceeds 512 bytes")
+		return Draft{}, fmt.Errorf("%w: secret reference exceeds 512 bytes", ErrInvalid)
 	}
 	if draft.SetDefault && !draft.Enabled {
-		return Draft{}, errors.New("modelconfig: a disabled config cannot be the default")
+		return Draft{}, fmt.Errorf("%w: a disabled config cannot be the default", ErrInvalid)
 	}
 
 	baseURL, err := normalizeBaseURL(draft.BaseURL)
@@ -113,23 +114,23 @@ func Normalize(draft Draft) (Draft, error) {
 func normalizeBaseURL(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if len(value) > 2048 {
-		return "", errors.New("modelconfig: base url exceeds 2048 bytes")
+		return "", fmt.Errorf("%w: base url exceeds 2048 bytes", ErrInvalid)
 	}
 	parsed, err := url.Parse(value)
 	if err != nil {
-		return "", fmt.Errorf("modelconfig: parsing base url: %w", err)
+		return "", fmt.Errorf("%w: parsing base url: %w", ErrInvalid, err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", errors.New("modelconfig: base url must use http or https")
+		return "", fmt.Errorf("%w: base url must use http or https", ErrInvalid)
 	}
 	if parsed.Host == "" {
-		return "", errors.New("modelconfig: base url must include a host")
+		return "", fmt.Errorf("%w: base url must include a host", ErrInvalid)
 	}
 	if parsed.User != nil {
-		return "", errors.New("modelconfig: base url must not include credentials")
+		return "", fmt.Errorf("%w: base url must not include credentials", ErrInvalid)
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", errors.New("modelconfig: base url must not include a query or fragment")
+		return "", fmt.Errorf("%w: base url must not include a query or fragment", ErrInvalid)
 	}
 	return strings.TrimRight(parsed.String(), "/"), nil
 }

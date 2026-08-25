@@ -23,6 +23,7 @@ import (
 	"github.com/userInner/kern/internal/artifact"
 	"github.com/userInner/kern/internal/evalservice"
 	"github.com/userInner/kern/internal/evaluation"
+	"github.com/userInner/kern/internal/modelconfig"
 	"github.com/userInner/kern/internal/operation"
 	"github.com/userInner/kern/internal/plan"
 	"github.com/userInner/kern/internal/plugin"
@@ -984,6 +985,31 @@ func TestServerMapsNativeCredentialErrorsWithoutLeakingBackendDetails(t *testing
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestServerMapsInvalidModelConfigWithoutLeakingValidationDetails(t *testing.T) {
+	_, validationErr := modelconfig.Normalize(modelconfig.Draft{
+		Name:     "model",
+		Provider: modelconfig.ProviderOpenAICompatible,
+		BaseURL:  "https://user:secret@example.com",
+		Model:    "test",
+	})
+	if validationErr == nil {
+		t.Fatal("Normalize() error = nil")
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/model-configs", nil)
+	new(Server).writeModelConfigError(
+		response,
+		request,
+		fmt.Errorf("storing candidate sk-private: %w", validationErr),
+	)
+	body := response.Body.String()
+	if response.Code != http.StatusBadRequest || !strings.Contains(body, "invalid model config") ||
+		strings.Contains(body, "credentials") || strings.Contains(body, "sk-private") {
+		t.Fatalf("status=%d body=%s", response.Code, body)
 	}
 }
 
