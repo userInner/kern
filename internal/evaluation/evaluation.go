@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/userInner/kern/internal/jsonschema"
@@ -43,6 +44,16 @@ type Suite struct {
 	Variants      []Variant `json:"variants"`
 	Cases         []Case    `json:"cases"`
 	Root          string    `json:"-"`
+	rootAnchor    string
+	rootRelative  string
+	rootScope     *suiteRoot
+}
+
+type suiteRoot struct {
+	root  *os.Root
+	owned bool
+	once  sync.Once
+	err   error
 }
 
 // Defaults fixes execution conditions shared by every case and variant.
@@ -117,7 +128,88 @@ func Load(name string) (Suite, error) {
 		return Suite{}, fmt.Errorf("evaluation: opening suite: %w", err)
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxSuiteBytes+1))
+	absolute, err := filepath.Abs(filepath.Dir(name))
+	if err != nil {
+		return Suite{}, fmt.Errorf("evaluation: resolving suite root: %w", err)
+	}
+	return decodeSuite(file, absolute, absolute, ".", nil)
+}
+
+// LoadFromRoot reads a suite selected by a portable relative path beneath an
+// explicitly trusted root. Unlike Load, this entry point is safe for paths
+// received across an HTTP or SDK trust boundary.
+func LoadFromRoot(root, name string) (Suite, error) {
+	if strings.TrimSpace(root) == "" {
+		return Suite{}, errors.New("evaluation: trusted suite root is required")
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return Suite{}, fmt.Errorf("evaluation: resolving trusted suite root: %w", err)
+	}
+	rootHandle, err := os.OpenRoot(absoluteRoot)
+	if err != nil {
+		return Suite{}, fmt.Errorf("evaluation: opening trusted suite root: %w", err)
+	}
+	scope := &suiteRoot{root: rootHandle, owned: true}
+	suite, loadErr := loadFromRoot(scope, name)
+	if loadErr != nil {
+		return Suite{}, errors.Join(loadErr, scope.close())
+	}
+	return suite, nil
+}
+
+// LoadFromRootHandle reads a suite beneath a stable, pre-opened root
+// capability. The caller retains ownership of root and must keep it open for
+// as long as the returned suite may read prompts or fixtures.
+func LoadFromRootHandle(root *os.Root, name string) (Suite, error) {
+	if root == nil {
+		return Suite{}, errors.New("evaluation: trusted suite root is required")
+	}
+	return loadFromRoot(&suiteRoot{root: root}, name)
+}
+
+func loadFromRoot(scope *suiteRoot, name string) (Suite, error) {
+	rootHandle := scope.root
+	absoluteRoot := rootHandle.Name()
+
+	relative, err := normalizeSuitePath(name)
+	if err != nil {
+		return Suite{}, err
+	}
+	native := filepath.FromSlash(relative)
+	if !filepath.IsLocal(native) {
+		return Suite{}, fmt.Errorf("%w: suite path must remain within the trusted root", ErrInvalidSuite)
+	}
+	info, err := rootHandle.Stat(native)
+	if err != nil {
+		return Suite{}, fmt.Errorf("evaluation: reading suite path: %w", err)
+	}
+	if info.IsDir() {
+		relative = path.Join(relative, "suite.json")
+		native = filepath.FromSlash(relative)
+		if !filepath.IsLocal(native) {
+			return Suite{}, fmt.Errorf("%w: suite path must remain within the trusted root", ErrInvalidSuite)
+		}
+		info, err = rootHandle.Stat(native)
+		if err != nil {
+			return Suite{}, fmt.Errorf("evaluation: reading suite path: %w", err)
+		}
+	}
+	if !info.Mode().IsRegular() {
+		return Suite{}, fmt.Errorf("%w: suite must be a regular file", ErrInvalidSuite)
+	}
+	file, err := rootHandle.Open(native)
+	if err != nil {
+		return Suite{}, fmt.Errorf("evaluation: opening suite: %w", err)
+	}
+	defer file.Close()
+	suiteDirectory := path.Dir(relative)
+	suiteRoot := filepath.Join(absoluteRoot, filepath.FromSlash(suiteDirectory))
+	return decodeSuite(file, suiteRoot, absoluteRoot, suiteDirectory, scope)
+}
+
+func decodeSuite(reader io.Reader, displayRoot, rootAnchor, rootRelative string, scope *suiteRoot) (Suite, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxSuiteBytes+1))
 	if err != nil {
 		return Suite{}, fmt.Errorf("evaluation: reading suite: %w", err)
 	}
@@ -133,15 +225,45 @@ func Load(name string) (Suite, error) {
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return Suite{}, fmt.Errorf("%w: suite must contain one JSON object", ErrInvalidSuite)
 	}
-	absolute, err := filepath.Abs(filepath.Dir(name))
-	if err != nil {
-		return Suite{}, fmt.Errorf("evaluation: resolving suite root: %w", err)
-	}
-	suite.Root = absolute
+	suite.Root = displayRoot
+	suite.rootAnchor = rootAnchor
+	suite.rootRelative = rootRelative
+	suite.rootScope = scope
 	if err := Validate(suite); err != nil {
 		return Suite{}, err
 	}
 	return suite, nil
+}
+
+// Close releases a root capability owned by LoadFromRoot or Snapshot. It is
+// safe to call on copies of a Suite and has no effect for Load,
+// LoadFromRootHandle, or suites decoded from JSON.
+func (s Suite) Close() error {
+	if s.rootScope == nil {
+		return nil
+	}
+	return s.rootScope.close()
+}
+
+func (r *suiteRoot) close() error {
+	if r == nil || !r.owned {
+		return nil
+	}
+	r.once.Do(func() { r.err = r.root.Close() })
+	return r.err
+}
+
+func normalizeSuitePath(value string) (string, error) {
+	value = strings.TrimPrefix(value, "./")
+	if value == "" || strings.ContainsAny(value, `\:`+"\x00") || path.IsAbs(value) {
+		return "", fmt.Errorf("%w: suite path must be relative to the trusted root", ErrInvalidSuite)
+	}
+	clean := path.Clean(value)
+	if clean != value || clean == ".." || strings.HasPrefix(clean, "../") ||
+		!filepath.IsLocal(filepath.FromSlash(clean)) {
+		return "", fmt.Errorf("%w: suite path must be canonical and remain within the trusted root", ErrInvalidSuite)
+	}
+	return clean, nil
 }
 
 // Validate rejects ambiguous, unsafe, or irreproducible suite definitions.
@@ -234,11 +356,19 @@ func Validate(suite Suite) error {
 
 // PromptText loads one case prompt within the suite root.
 func (s Suite) PromptText(evalCase Case) (string, error) {
-	name, err := resolveWithin(s.Root, evalCase.Prompt)
+	if !safeRelative(evalCase.Prompt) {
+		return "", fmt.Errorf("%w: unsafe relative path %q", ErrInvalidSuite, evalCase.Prompt)
+	}
+	native := filepath.FromSlash(evalCase.Prompt)
+	if !filepath.IsLocal(native) {
+		return "", fmt.Errorf("%w: prompt path is not local", ErrInvalidSuite)
+	}
+	root, err := s.openRoot()
 	if err != nil {
 		return "", err
 	}
-	file, err := os.Open(name)
+	defer root.Close()
+	file, err := root.Open(native)
 	if err != nil {
 		return "", fmt.Errorf("evaluation: opening prompt: %w", err)
 	}
@@ -253,20 +383,71 @@ func (s Suite) PromptText(evalCase Case) (string, error) {
 	return string(data), nil
 }
 
-// FixturePath resolves a fixture without allowing escape from the suite root.
-func (s Suite) FixturePath(evalCase Case) (string, error) {
-	name, err := resolveWithin(s.Root, evalCase.Fixture)
+func (s Suite) openRoot() (*os.Root, error) {
+	if s.rootScope != nil {
+		if s.rootScope.root == nil {
+			return nil, errors.New("evaluation: suite root is unavailable")
+		}
+		relative := s.rootRelative
+		if relative == "" {
+			relative = "."
+		}
+		root, err := s.rootScope.root.OpenRoot(filepath.FromSlash(relative))
+		if err != nil {
+			return nil, fmt.Errorf("evaluation: opening suite directory: %w", err)
+		}
+		return root, nil
+	}
+	anchor := s.rootAnchor
+	relative := s.rootRelative
+	if anchor == "" {
+		anchor = s.Root
+		relative = "."
+	}
+	if strings.TrimSpace(anchor) == "" {
+		return nil, errors.New("evaluation: suite root is unavailable")
+	}
+	root, err := os.OpenRoot(anchor)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("evaluation: opening suite root: %w", err)
 	}
-	info, err := os.Stat(name)
+	if relative == "" || relative == "." {
+		return root, nil
+	}
+	subroot, err := root.OpenRoot(filepath.FromSlash(relative))
+	closeErr := root.Close()
 	if err != nil {
-		return "", fmt.Errorf("evaluation: reading fixture: %w", err)
+		return nil, fmt.Errorf("evaluation: opening suite directory: %w", err)
 	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("%w: v1 fixture must be a directory", ErrInvalidSuite)
+	if closeErr != nil {
+		_ = subroot.Close()
+		return nil, fmt.Errorf("evaluation: closing trusted suite root: %w", closeErr)
 	}
-	return name, nil
+	return subroot, nil
+}
+
+func (s Suite) openFixture(evalCase Case) (*os.Root, error) {
+	if !safeRelative(evalCase.Fixture) {
+		return nil, fmt.Errorf("%w: unsafe relative path %q", ErrInvalidSuite, evalCase.Fixture)
+	}
+	native := filepath.FromSlash(evalCase.Fixture)
+	if !filepath.IsLocal(native) {
+		return nil, fmt.Errorf("%w: fixture path is not local", ErrInvalidSuite)
+	}
+	root, err := s.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	fixture, err := root.OpenRoot(native)
+	closeErr := root.Close()
+	if err != nil {
+		return nil, fmt.Errorf("evaluation: opening fixture: %w", err)
+	}
+	if closeErr != nil {
+		_ = fixture.Close()
+		return nil, fmt.Errorf("evaluation: closing suite root: %w", closeErr)
+	}
+	return fixture, nil
 }
 
 func validateGrader(grader Grader, allowed []string, judgeConfigured bool) error {
@@ -380,16 +561,4 @@ func safeRelative(value string) bool {
 	}
 	clean := path.Clean(value)
 	return clean == value && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
-}
-
-func resolveWithin(root, relative string) (string, error) {
-	if !safeRelative(relative) {
-		return "", fmt.Errorf("%w: unsafe relative path %q", ErrInvalidSuite, relative)
-	}
-	name := filepath.Join(root, filepath.FromSlash(relative))
-	rel, err := filepath.Rel(root, name)
-	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("%w: path escapes suite root", ErrInvalidSuite)
-	}
-	return name, nil
 }

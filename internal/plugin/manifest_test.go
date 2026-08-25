@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,107 @@ func TestValidateManifestRejectsTraversalAndIncompatibility(t *testing.T) {
 	if err := ValidateManifest(manifest); !errors.Is(err, ErrInvalidManifest) {
 		t.Fatalf("ValidateManifest(host namespace) error = %v", err)
 	}
+}
+
+func TestValidateManifestRejectsUnsafeEntrypointPaths(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "absolute", path: "/etc/passwd"},
+		{name: "parent", path: "../secret"},
+		{name: "cleaned parent", path: "knowledge/../secret"},
+		{name: "backslash", path: `knowledge\secret.md`},
+		{name: "NUL", path: "knowledge/secret\x00.md"},
+		{name: "Windows absolute", path: "C:/Windows/system.ini"},
+		{name: "Windows drive relative", path: "C:secret.txt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := validManifest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+			manifest.Entrypoints.Knowledge = []string{test.path}
+			if err := ValidateManifest(manifest); !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("ValidateManifest(%q) error = %v, want ErrInvalidManifest", test.path, err)
+			}
+		})
+	}
+}
+
+func TestRootPackageAPIsRejectSymbolicLinks(t *testing.T) {
+	t.Parallel()
+
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.md"), []byte("outside\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(outside) error = %v", err)
+	}
+
+	t.Run("manifest", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.Symlink(filepath.Join(outside, "secret.md"), filepath.Join(directory, ManifestFile)); err != nil {
+			t.Skipf("Symlink() unavailable: %v", err)
+		}
+		root, err := os.OpenRoot(directory)
+		if err != nil {
+			t.Fatalf("OpenRoot() error = %v", err)
+		}
+		defer root.Close()
+		if _, _, err := LoadManifestRoot(root); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+			t.Fatalf("LoadManifestRoot() error = %v, want symbolic-link rejection", err)
+		}
+	})
+
+	t.Run("final entrypoint", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.Symlink(filepath.Join(outside, "secret.md"), filepath.Join(directory, "entry.md")); err != nil {
+			t.Skipf("Symlink() unavailable: %v", err)
+		}
+		root, err := os.OpenRoot(directory)
+		if err != nil {
+			t.Fatalf("OpenRoot() error = %v", err)
+		}
+		defer root.Close()
+		manifest := validManifest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+		manifest.Entrypoints.Knowledge = []string{"entry.md"}
+		if _, err := VerifyPackageRoot(root, manifest); !errors.Is(err, ErrInvalidManifest) ||
+			!strings.Contains(err.Error(), "symbolic link") {
+			t.Fatalf("VerifyPackageRoot() error = %v, want symbolic-link rejection", err)
+		}
+	})
+
+	t.Run("intermediate entrypoint", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(directory, "pivot")); err != nil {
+			t.Skipf("Symlink() unavailable: %v", err)
+		}
+		root, err := os.OpenRoot(directory)
+		if err != nil {
+			t.Fatalf("OpenRoot() error = %v", err)
+		}
+		defer root.Close()
+		manifest := validManifest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+		manifest.Entrypoints.Knowledge = []string{"pivot/secret.md"}
+		if _, err := VerifyPackageRoot(root, manifest); !errors.Is(err, ErrInvalidManifest) ||
+			!strings.Contains(err.Error(), "symbolic link") {
+			t.Fatalf("VerifyPackageRoot() error = %v, want intermediate symbolic-link rejection", err)
+		}
+	})
+
+	t.Run("digest", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.Symlink(filepath.Join(outside, "secret.md"), filepath.Join(directory, "payload.md")); err != nil {
+			t.Skipf("Symlink() unavailable: %v", err)
+		}
+		root, err := os.OpenRoot(directory)
+		if err != nil {
+			t.Fatalf("OpenRoot() error = %v", err)
+		}
+		defer root.Close()
+		if _, err := PackageDigestRoot(root); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+			t.Fatalf("PackageDigestRoot() error = %v, want symbolic-link rejection", err)
+		}
+	})
 }
 
 func TestValidateManifestProcessPermissions(t *testing.T) {

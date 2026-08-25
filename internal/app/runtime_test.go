@@ -25,6 +25,7 @@ import (
 	"github.com/userInner/kern/internal/modelconfig"
 	"github.com/userInner/kern/internal/operation"
 	"github.com/userInner/kern/internal/plugin"
+	"github.com/userInner/kern/internal/pluginmanager"
 	"github.com/userInner/kern/internal/pluginruntime"
 	"github.com/userInner/kern/internal/policy"
 	"github.com/userInner/kern/internal/secret"
@@ -67,6 +68,48 @@ func TestRuntimeOfflineLifecycle(t *testing.T) {
 	}
 	if len(events) < 10 {
 		t.Fatalf("EventsAfter() count = %d, want at least 10", len(events))
+	}
+}
+
+func TestRuntimeCloseIsIdempotentAndClosesPluginManager(t *testing.T) {
+	t.Setenv("KERN_MODEL_BASE_URL", "")
+	t.Setenv("KERN_MODEL", "")
+	runtime, err := Open(t.Context(), Config{
+		DataDir: t.TempDir(),
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close(repeat) error = %v", err)
+	}
+	if _, err := runtime.Plugins.List(t.Context()); !errors.Is(err, pluginmanager.ErrClosed) {
+		t.Fatalf("Plugins.List() after Runtime.Close error = %v, want ErrClosed", err)
+	}
+	if err := (*Runtime)(nil).Close(); err != nil {
+		t.Fatalf("(*Runtime)(nil).Close() error = %v", err)
+	}
+}
+
+func TestRuntimeOpenFailureReleasesPluginStorageRoot(t *testing.T) {
+	t.Setenv("KERN_MODEL_BASE_URL", "")
+	t.Setenv("KERN_MODEL", "")
+	dataDir := t.TempDir()
+	if _, err := Open(t.Context(), Config{
+		DataDir:       dataDir,
+		PolicyProfile: "not-a-policy",
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}); err == nil {
+		t.Fatal("Open(invalid policy) error = nil")
+	}
+	plugins := filepath.Join(dataDir, "plugins")
+	moved := filepath.Join(dataDir, "plugins-closed")
+	if err := os.Rename(plugins, moved); err != nil {
+		t.Fatalf("Rename(plugin storage after failed Open) error = %v", err)
 	}
 }
 
@@ -1391,9 +1434,20 @@ func TestRuntimeRecoversShutdownWhileWaitingApproval(t *testing.T) {
 		t.Fatalf("Open(recovery) error = %v", err)
 	}
 	t.Cleanup(func() { _ = recovered.Close() })
-	completed, err := recovered.Wait(t.Context(), created.ID)
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelWait()
+	completed, err := recovered.Wait(waitCtx, created.ID)
 	if err != nil {
-		t.Fatalf("Wait(recovery) error = %v", err)
+		current, taskErr := recovered.Store.GetTask(t.Context(), created.ID)
+		events, eventErr := recovered.Store.EventsAfter(t.Context(), created.ID, 0, 100)
+		t.Fatalf(
+			"Wait(recovery) error = %v; task=%#v task_err=%v events=%#v event_err=%v",
+			err,
+			current,
+			taskErr,
+			events,
+			eventErr,
+		)
 	}
 	if completed.Status != task.StatusCompleted || completed.ActiveAttemptID == created.ActiveAttemptID {
 		t.Fatalf("recovered task = %#v", completed)

@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,30 +53,7 @@ func TestRuntimeRunsTypedClientAndReplayableEvents(t *testing.T) {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
 
-	streamCtx, streamCancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer streamCancel()
-	stream, err := client.OpenEventStream(streamCtx, created.ID, 0)
-	if err != nil {
-		t.Fatalf("OpenEventStream() error = %v", err)
-	}
-	var terminalEvent bool
-	for !terminalEvent {
-		event, err := stream.Next()
-		if err != nil {
-			t.Fatalf("EventStream.Next() error = %v", err)
-		}
-		switch event.Type {
-		case "task.completed", "task.partially_completed", "task.failed", "task.cancelled":
-			terminalEvent = true
-		}
-	}
-	if err := stream.Close(); err != nil {
-		t.Fatalf("EventStream.Close() error = %v", err)
-	}
-	item, err := client.GetTask(t.Context(), created.ID)
-	if err != nil {
-		t.Fatalf("GetTask() error = %v", err)
-	}
+	item := waitForTerminalTask(t, client, created.ID)
 	if !item.Status.Terminal() || item.Result == "" {
 		t.Fatalf("task = %#v, want terminal result", item)
 	}
@@ -112,6 +91,89 @@ func TestRuntimeClosesWhenHostContextIsCancelled(t *testing.T) {
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestRuntimeCloseStopsLiveEventStreamWithoutGraceTimeout(t *testing.T) {
+	t.Setenv("KERN_MODEL_BASE_URL", "")
+	t.Setenv("KERN_MODEL", "")
+	runtime, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:      t.TempDir(),
+		WorkspaceDir: t.TempDir(),
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	created, err := runtime.Client().CreateTask(t.Context(), kern.CreateTaskInput{Goal: "open a shutdown stream"})
+	if err != nil {
+		_ = runtime.Close()
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	stream, err := runtime.Client().OpenEventStream(context.Background(), created.ID, 0)
+	if err != nil {
+		_ = runtime.Close()
+		t.Fatalf("OpenEventStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	started := time.Now()
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Close() took %s with a live event stream", elapsed)
+	}
+	for range 100 {
+		if _, err := stream.Next(); err != nil {
+			return
+		}
+	}
+	t.Fatal("event stream did not reach EOF after runtime shutdown")
+}
+
+func TestRuntimeDisablesEvaluationWithoutTrustedRoot(t *testing.T) {
+	runtime, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:      t.TempDir(),
+		WorkspaceDir: t.TempDir(),
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer runtime.Close()
+
+	_, err = runtime.Client().StartEvaluation(t.Context(), kern.StartEvaluationInput{SuitePath: "suite"})
+	var apiErr *kern.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(apiErr.Message, "evaluation root is not configured") {
+		t.Fatalf("StartEvaluation() error = %#v", err)
+	}
+}
+
+func TestRuntimeRejectsEvaluationStorageOverlappingAgentWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	_, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:        filepath.Join(workspace, "kern-data"),
+		WorkspaceDir:   workspace,
+		EvaluationRoot: t.TempDir(),
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "data root and writable agent roots must not overlap") {
+		t.Fatalf("Open(overlapping evaluation storage) error = %v", err)
+	}
+}
+
+func TestRuntimeRejectsEvaluationRootOverlappingAgentWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	_, err := embedded.Open(t.Context(), embedded.Config{
+		DataDir:        t.TempDir(),
+		WorkspaceDir:   workspace,
+		EvaluationRoot: workspace,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "evaluation root and writable agent roots must not overlap") {
+		t.Fatalf("Open(overlapping evaluation root) error = %v", err)
 	}
 }
 
@@ -179,18 +241,7 @@ func TestRuntimeUsesRegisteredModelProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var item kern.Task
-	for time.Now().Before(deadline) {
-		item, err = runtime.Client().GetTask(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("GetTask() error = %v", err)
-		}
-		if item.Status.Terminal() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	item := waitForTerminalTask(t, runtime.Client(), created.ID)
 	if !item.Status.Terminal() || item.Result != "Response from the registered provider." {
 		t.Fatalf("task = %#v", item)
 	}
@@ -234,18 +285,7 @@ func TestRuntimeInvokesRegisteredCapabilityThroughCoreTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var item kern.Task
-	for time.Now().Before(deadline) {
-		item, err = runtime.Client().GetTask(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("GetTask() error = %v", err)
-		}
-		if item.Status.Terminal() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	item := waitForTerminalTask(t, runtime.Client(), created.ID)
 	if !item.Status.Terminal() || item.Result != "Host capability completed with evidence." || handlerCalls.Load() != 1 {
 		t.Fatalf("task=%#v handler calls=%d", item, handlerCalls.Load())
 	}
@@ -289,17 +329,10 @@ func TestRegisteredCapabilityCannotBypassApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var approvals []kern.Approval
-	for time.Now().Before(deadline) {
-		approvals, err = runtime.Client().PendingApprovals(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("PendingApprovals() error = %v", err)
-		}
-		if len(approvals) > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	waitForTaskEvent(t, runtime.Client(), created.ID, "approval.requested")
+	approvals, err := runtime.Client().PendingApprovals(t.Context(), created.ID)
+	if err != nil {
+		t.Fatalf("PendingApprovals() error = %v", err)
 	}
 	if len(approvals) != 1 || handlerCalls.Load() != 0 {
 		t.Fatalf("approvals=%#v handler calls=%d", approvals, handlerCalls.Load())
@@ -307,20 +340,56 @@ func TestRegisteredCapabilityCannotBypassApproval(t *testing.T) {
 	if _, err := runtime.Client().DecideApproval(t.Context(), approvals[0].ID, "approved"); err != nil {
 		t.Fatalf("DecideApproval() error = %v", err)
 	}
-	deadline = time.Now().Add(5 * time.Second)
-	var item kern.Task
-	for time.Now().Before(deadline) {
-		item, err = runtime.Client().GetTask(t.Context(), created.ID)
-		if err != nil {
-			t.Fatalf("GetTask() error = %v", err)
-		}
-		if item.Status.Terminal() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	item := waitForTerminalTask(t, runtime.Client(), created.ID)
 	if !item.Status.Terminal() || handlerCalls.Load() != 1 {
 		t.Fatalf("task=%#v handler calls=%d", item, handlerCalls.Load())
+	}
+}
+
+func waitForTerminalTask(t *testing.T, client *kern.Client, taskID string) kern.Task {
+	t.Helper()
+	waitForTaskEvent(t, client, taskID,
+		"task.completed", "task.partially_completed", "task.failed", "task.cancelled")
+	item, err := client.GetTask(t.Context(), taskID)
+	if err != nil {
+		t.Fatalf("GetTask() error = %v", err)
+	}
+	return item
+}
+
+func waitForTaskEvent(t *testing.T, client *kern.Client, taskID string, eventTypes ...string) kern.Event {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	stream, err := client.OpenEventStream(ctx, taskID, 0)
+	if err != nil {
+		t.Fatalf("OpenEventStream() error = %v", err)
+	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("EventStream.Close() error = %v", err)
+		}
+	}()
+
+	wanted := make(map[string]struct{}, len(eventTypes))
+	for _, eventType := range eventTypes {
+		wanted[eventType] = struct{}{}
+	}
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			item, taskErr := client.GetTask(t.Context(), taskID)
+			t.Fatalf(
+				"waiting for task event %v: %v; task=%#v task_err=%v",
+				eventTypes,
+				err,
+				item,
+				taskErr,
+			)
+		}
+		if _, ok := wanted[event.Type]; ok {
+			return event
+		}
 	}
 }
 

@@ -208,6 +208,7 @@ button { color: inherit; }
 .artifact-list { display: grid; gap: 8px; margin-top: 12px; }
 .artifact-item { min-width: 0; }
 .artifact-row {
+  width: 100%; cursor: pointer; text-align: left;
   min-width: 0; padding: 12px 14px; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto;
   align-items: center; gap: 10px; border: 1px solid #c8ced5; background: rgba(255,255,255,.8);
   color: inherit; text-decoration: none;
@@ -460,7 +461,7 @@ button { color: inherit; }
 .eval-failures > div:not(.eval-subheading) span { overflow: hidden; font: 8px "SFMono-Regular", monospace; text-overflow: ellipsis; }
 .eval-failures > div:not(.eval-subheading) small { color: #78818c; font-size: 8px; }
 .eval-failures > div:not(.eval-subheading) b { color: #a52f20; font: 8px "SFMono-Regular", monospace; }
-.download-report { margin-top: 12px; display: inline-block; border-bottom: 1px solid #2b59ff; color: #2b59ff; text-decoration: none; font-size: 9px; font-weight: 700; }
+.download-report { margin-top: 12px; padding: 0; display: inline-block; border: 0; border-bottom: 1px solid #2b59ff; background: transparent; color: #2b59ff; cursor: pointer; text-decoration: none; font-size: 9px; font-weight: 700; }
 
 button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #f3a712; outline-offset: 2px; }
 @keyframes blink { 50% { opacity: .2; } }

@@ -63,7 +63,8 @@ func EnrichSuite(suite *evaluation.Suite, selected []string, pluginSources map[s
 		if len(variant.Plugins) == 0 {
 			continue
 		}
-		variant.PluginDigests = make(map[string]string, len(variant.Plugins))
+		expectedDigests := variant.PluginDigests
+		resolvedDigests := make(map[string]string, len(variant.Plugins))
 		for _, reference := range variant.Plugins {
 			pluginID, version, _ := strings.Cut(reference, "@")
 			source := strings.TrimSpace(pluginSources[pluginID])
@@ -81,8 +82,12 @@ func EnrichSuite(suite *evaluation.Suite, selected []string, pluginSources map[s
 			if err != nil {
 				return err
 			}
-			variant.PluginDigests[pluginID] = digest
+			if expected := expectedDigests[pluginID]; expected != "" && expected != digest {
+				return fmt.Errorf("evalrunner: plugin %s digest is %s, want %s", pluginID, digest, expected)
+			}
+			resolvedDigests[pluginID] = digest
 		}
+		variant.PluginDigests = resolvedDigests
 	}
 	return evaluation.Validate(*suite)
 }
@@ -188,6 +193,15 @@ func (a *KernAgent) Run(
 				installed.ID,
 				installed.Version,
 				reference,
+			)
+		}
+		expectedDigest := request.Variant.PluginDigests[pluginID]
+		if expectedDigest == "" || installed.Digest != expectedDigest {
+			return evaluation.AgentResult{}, fmt.Errorf(
+				"evalrunner: installed plugin %s digest is %s, want %s",
+				pluginID,
+				installed.Digest,
+				expectedDigest,
 			)
 		}
 		pluginIDs = append(pluginIDs, pluginID)

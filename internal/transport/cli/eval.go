@@ -278,7 +278,7 @@ func runEvalSuite(
 		}
 	}
 	now := time.Now().UTC()
-	configDigest, _, err := evaluation.PrepareRun(suite, selected)
+	configDigest, _, err := evaluation.PrepareRunContext(ctx, suite, selected)
 	if err != nil {
 		return err
 	}

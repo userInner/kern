@@ -28,6 +28,28 @@ func (fakeEvalAgent) Run(_ context.Context, request AgentRequest) (AgentResult, 
 	}, nil
 }
 
+type snapshotMutatingAgent struct {
+	mu     sync.Mutex
+	calls  int
+	mutate func() error
+}
+
+func (a *snapshotMutatingAgent) Run(_ context.Context, request AgentRequest) (AgentResult, error) {
+	a.mu.Lock()
+	a.calls++
+	call := a.calls
+	a.mu.Unlock()
+	if call == 1 {
+		if err := a.mutate(); err != nil {
+			return AgentResult{}, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(request.WorkspaceDir, "result.txt"), []byte("fixed"), 0o600); err != nil {
+		return AgentResult{}, err
+	}
+	return AgentResult{TaskID: "task-" + request.CaseID, TaskStatus: "completed"}, nil
+}
+
 type pairedStartAgent struct {
 	mu            sync.Mutex
 	starts        []AgentRequest
@@ -203,14 +225,14 @@ func TestSuiteDigestChangesWhenPromptOrFixtureChanges(t *testing.T) {
 	}
 	suite := validSuite()
 	suite.Root = root
-	first, firstIdentity, err := suiteDigest(suite, suite.Variants)
+	first, firstIdentity, err := suiteDigest(t.Context(), suite, suite.Variants)
 	if err != nil {
 		t.Fatalf("suiteDigest(first) error = %v", err)
 	}
 	if err := os.WriteFile(promptPath, []byte("second prompt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	second, secondIdentity, err := suiteDigest(suite, suite.Variants)
+	second, secondIdentity, err := suiteDigest(t.Context(), suite, suite.Variants)
 	if err != nil {
 		t.Fatalf("suiteDigest(second) error = %v", err)
 	}
@@ -220,12 +242,81 @@ func TestSuiteDigestChangesWhenPromptOrFixtureChanges(t *testing.T) {
 	if err := os.WriteFile(fixturePath, []byte("second fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	third, thirdIdentity, err := suiteDigest(suite, suite.Variants)
+	third, thirdIdentity, err := suiteDigest(t.Context(), suite, suite.Variants)
 	if err != nil {
 		t.Fatalf("suiteDigest(third) error = %v", err)
 	}
 	if second == third || secondIdentity.Inputs[0].FixtureSHA256 == thirdIdentity.Inputs[0].FixtureSHA256 {
 		t.Fatalf("fixture mutation did not change digest: %q", second)
+	}
+}
+
+func TestRunnerRejectsInputsChangedAfterRunIdentityIsFixed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(root string) error
+		want   string
+	}{
+		{
+			name: "prompt",
+			mutate: func(root string) error {
+				return os.WriteFile(filepath.Join(root, "second.md"), []byte("tampered prompt"), 0o600)
+			},
+			want: "prompt changed after run identity was fixed",
+		},
+		{
+			name: "fixture",
+			mutate: func(root string) error {
+				return os.WriteFile(filepath.Join(root, "second", "result.txt"), []byte("tampered fixture"), 0o600)
+			},
+			want: "fixture changed after run identity was fixed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			for _, name := range []string{"first", "second"} {
+				if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, name, "result.txt"), []byte("broken"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, name+".md"), []byte("repair result"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			suite := validSuite()
+			suite.Root = root
+			suite.Defaults.WorkerCount = 1
+			suite.Defaults.Retries = 0
+			suite.Variants = suite.Variants[:1]
+			suite.Cases = []Case{
+				{ID: "case.first", Fixture: "first", Prompt: "first.md", Graders: []Grader{{
+					ID: "result.fixed", Type: "file_contains", Required: true, Path: "result.txt", Contains: "fixed",
+				}}},
+				{ID: "case.second", Fixture: "second", Prompt: "second.md", Graders: []Grader{{
+					ID: "result.fixed", Type: "file_contains", Required: true, Path: "result.txt", Contains: "fixed",
+				}}},
+			}
+			agent := &snapshotMutatingAgent{mutate: func() error { return test.mutate(root) }}
+			runner, err := NewRunner(t.TempDir(), agent, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report, err := runner.Run(t.Context(), suite, nil)
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(report.Results) != 2 || !strings.Contains(report.Results[1].Error, test.want) {
+				t.Fatalf("results = %#v, want second failure containing %q", report.Results, test.want)
+			}
+			agent.mu.Lock()
+			calls := agent.calls
+			agent.mu.Unlock()
+			if calls != 1 {
+				t.Fatalf("agent calls = %d, want 1", calls)
+			}
+		})
 	}
 }
 

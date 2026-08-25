@@ -267,8 +267,18 @@ grader, and comparison-report path; it is not evidence of Expert quality. The
 comparison.
 
 Long evaluation runs can be paused, durably resumed, or cancelled from the Web
-workbench and HTTP API. Resume refuses to mix results when the suite, prompt,
-fixture, plugin, model, or grader identity changed. Suites may also configure a
+workbench and HTTP API. Starting or resuming through Web requires an explicit,
+trusted suite root that is outside both the Agent workspace and Kern's
+evaluation data directory:
+
+```sh
+./bin/kern web --eval-root /path/to/trusted/evals
+```
+
+API `suite_path` values are relative to that root; an omitted `--eval-root`
+leaves HTTP evaluation start/resume disabled. Each run freezes its suite,
+prompt, fixture, plugin and model identity before queueing, and resume rejects
+any change to that snapshot. Suites may also configure a
 non-required OpenAI-compatible model grader for bounded supplemental judgment;
 every model-graded case must retain a required deterministic grader, and only
 explicit evidence paths enter the judge request.
@@ -367,6 +377,7 @@ internal storage or engine types:
 runtime, err := embedded.Open(ctx, embedded.Config{
     DataDir:      "./kern-data",
     WorkspaceDir: ".",
+    // EvaluationRoot: "/path/to/trusted/evals", // optional, outside both paths above
 })
 if err != nil {
     return err
@@ -402,7 +413,11 @@ their own confirmation UI after first calling the non-mutating preview.
 make sdk
 ```
 
-The Vite development server proxies `/api` to a Kern server on port 8787:
+The Vite development server binds to `127.0.0.1`, obtains a signed short-lived
+browser token from Kern's loopback HTML bootstrap, and proxies `/api` to Kern
+on port 8787 with the backend's exact Host and Origin. This keeps development
+compatible with the same strict transport checks used by the bundled UI; no
+persistent API token is copied into source files or browser configuration:
 
 ```sh
 go run ./cmd/kern web --open=false
@@ -428,11 +443,21 @@ The dependency direction is `transport/adapters → application → domain`. Int
 ## Security defaults
 
 - Web binds to a loopback address only.
-- A random session token is stored in an HttpOnly, SameSite=Strict cookie.
-- Browser mutations require a matching Origin; API clients can use a bearer token.
+- HTTP and HTTPS handlers require both a configured loopback Host and an actual
+  loopback network peer; the request's TLS state must match the configured URL.
+- Kern never uses authentication cookies. The persistent random API token stays
+  server-side; the bundled UI receives a signed 24-hour bearer token through
+  same-origin HTML bootstrap and keeps it only in memory or `sessionStorage`.
+- Browser mutations require a matching Origin; non-browser API clients use the
+  persistent bearer token without an Origin header.
 - Request and model-response bodies have hard size limits.
 - CSP, frame, referrer, and MIME-sniffing protections are set on all responses.
 - Database calls carry context and all SQL values are parameterized.
+
+The loopback browser bootstrap is designed to block remote web origins, not a
+hostile process already running as the same operating-system user. Run Kern
+under a dedicated OS account when same-user local processes are outside your
+trust boundary.
 
 ## Project documentation
 

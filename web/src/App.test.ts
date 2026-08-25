@@ -3,13 +3,56 @@ import { describe, expect, it } from 'vitest'
 import {
   actionsFor,
   approvalExplanation,
+  authorizedRequestInit,
   diffLineClass,
+  fetchAuthorizedDownload,
   formatBytes,
   formatDuration,
   formatUSD,
+  parseSSEFrames,
   taskContinuationInput,
   taskSubmissionMode,
 } from './App'
+
+describe('browser API authentication', () => {
+  it('adds the in-memory bearer token without sending cookies', () => {
+    const init = authorizedRequestInit('short-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const headers = new Headers(init.headers)
+    expect(headers.get('Authorization')).toBe('Bearer short-session')
+    expect(headers.get('Content-Type')).toBe('application/json')
+    expect(init.credentials).toBe('omit')
+  })
+
+  it('downloads protected files with the bearer token and without cookies', async () => {
+    let observed: RequestInit | undefined
+    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observed = init
+      return new Response('protected artifact', { status: 200 })
+    }
+
+    const blob = await fetchAuthorizedDownload('/api/v1/artifact', 'download-session', fetcher)
+    const headers = new Headers(observed?.headers)
+    expect(headers.get('Authorization')).toBe('Bearer download-session')
+    expect(observed?.credentials).toBe('omit')
+    expect(await blob.text()).toBe('protected artifact')
+  })
+
+  it('parses chunk-ready SSE frames and preserves an incomplete tail', () => {
+    const parsed = parseSSEFrames(
+      ': keep-alive\r\nid: 7\r\nevent: task.completed\r\ndata: {"id":7}\r\n\r\n'
+      + 'id: 8\nevent: task.failed\ndata: first\ndata: second',
+    )
+    expect(parsed.events).toEqual([{
+      id: '7',
+      event: 'task.completed',
+      data: '{"id":7}',
+    }])
+    expect(parsed.remainder).toBe('id: 8\nevent: task.failed\ndata: first\ndata: second')
+  })
+})
 
 describe('task action presentation', () => {
   it.each([

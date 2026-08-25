@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/userInner/kern/internal/agent"
@@ -111,6 +112,8 @@ type Runtime struct {
 	vaultReady        bool
 	wasmPluginRuntime bool
 	logger            *slog.Logger
+	closeOnce         sync.Once
+	closeErr          error
 }
 
 var (
@@ -164,6 +167,12 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	cleanupPluginManager := true
+	defer func() {
+		if cleanupPluginManager {
+			_ = pluginManager.Close()
+		}
+	}()
 	wasmSandbox := config.WASMSandbox
 	wasmReady := false
 	if wasmSandbox != nil {
@@ -182,6 +191,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		config.HostCapabilities,
 	)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -192,18 +202,21 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		profile = policy.ProfileLocalSafe
 	}
 	if err := policyEvaluator.SetProfile(profile); err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
 	}
 	authorizer, err := authorization.New(store, policyEvaluator, authorization.Config{})
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
 	}
 	contextManager, err := contextbuilder.New(store, contextbuilder.Config{})
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -221,6 +234,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 	}
 	secretStore, err := secret.NewChain(secretResolvers...)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -242,6 +256,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		},
 	)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -256,6 +271,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 	}
 	settings, err := newSettingsState(settingsPath, retentionDays)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -271,6 +287,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		},
 	)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -281,6 +298,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		contextManager,
 	)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -291,6 +309,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 	}
 	coreVerificationSuite, err := verifier.New(store, artifactStore, workspaceRoot)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -302,6 +321,7 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 		workspaceRoot,
 	)
 	if err != nil {
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
@@ -334,10 +354,12 @@ func Open(ctx context.Context, config Config) (*Runtime, error) {
 	}
 	if err := runtime.recoverInterrupted(ctx); err != nil {
 		runtime.engine.Close()
+		_ = pluginManager.Close()
 		_ = workspaceRoot.Close()
 		_ = store.Close()
 		return nil, err
 	}
+	cleanupPluginManager = false
 	return runtime, nil
 }
 
@@ -764,8 +786,14 @@ func (r *Runtime) WaitForBoundary(ctx context.Context, taskID string) (task.Task
 
 // Close stops workers before closing storage.
 func (r *Runtime) Close() error {
-	r.engine.Close()
-	return errors.Join(r.Workspace.Close(), r.Store.Close())
+	if r == nil {
+		return nil
+	}
+	r.closeOnce.Do(func() {
+		r.engine.Close()
+		r.closeErr = errors.Join(r.Plugins.Close(), r.Workspace.Close(), r.Store.Close())
+	})
+	return r.closeErr
 }
 
 func (r *Runtime) startNewAttempt(

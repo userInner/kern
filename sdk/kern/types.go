@@ -454,8 +454,8 @@ type PluginUsage struct {
 	CreatedAt     time.Time       `json:"created_at"`
 }
 
-// InstallPluginInput installs a package from a local directory visible to the
-// Kern server and optionally enables it after integrity verification.
+// InstallPluginInput installs a package from a workspace-relative directory
+// and optionally enables it after integrity verification.
 type InstallPluginInput struct {
 	Source string `json:"source"`
 	Enable bool   `json:"enable,omitempty"`
@@ -478,7 +478,8 @@ func (s EvaluationStatus) Terminal() bool {
 	return s == EvaluationCompleted || s == EvaluationFailed || s == EvaluationCancelled
 }
 
-// StartEvaluationInput selects a local suite visible to Kern and its variants.
+// StartEvaluationInput selects a suite below the server's trusted evaluation
+// root and optionally narrows the variants to run.
 type StartEvaluationInput struct {
 	SuitePath string   `json:"suite_path"`
 	Variants  []string `json:"variants,omitempty"`

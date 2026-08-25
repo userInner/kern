@@ -2,9 +2,10 @@ openapi: 3.1.0
 info:
   title: Kern Core API
   version: 0.1.0
-  description: Initial task lifecycle and persisted-event API.
+  description: Loopback-only task lifecycle and persisted-event API. SDK clients use the configured bearer token; the bundled browser uses a signed, short-lived bearer token injected into its same-origin HTML bootstrap. Authentication cookies are not used.
 servers:
   - url: http://127.0.0.1:8787
+    description: Default loopback-only development server. Kern also validates the request peer, Host, Origin and configured HTTP/TLS mode.
 paths:
   /api/v1/health:
     get:
@@ -42,7 +43,6 @@ paths:
       operationId: getPrometheusMetrics
       description: Available only when observability.metrics_enabled is true. Labels use Core-controlled low-cardinality vocabularies.
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -59,7 +59,6 @@ paths:
     get:
       operationId: getRuntimeSettings
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -74,7 +73,6 @@ paths:
       operationId: updateRuntimeSettings
       description: Persists and applies settings to executions that start after this update. Running executions keep their original budget snapshot.
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -95,7 +93,6 @@ paths:
     get:
       operationId: previewRetentionCleanup
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -108,7 +105,6 @@ paths:
     post:
       operationId: runRetentionCleanup
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -135,7 +131,6 @@ paths:
     get:
       operationId: listTasks
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -155,7 +150,6 @@ paths:
     post:
       operationId: createTask
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -196,7 +190,6 @@ paths:
     get:
       operationId: listModelConfigs
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -224,7 +217,6 @@ paths:
     post:
       operationId: createModelConfig
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -249,7 +241,6 @@ paths:
     put:
       operationId: updateModelConfig
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -271,7 +262,6 @@ paths:
     delete:
       operationId: deleteModelConfig
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "204":
@@ -284,7 +274,6 @@ paths:
     post:
       operationId: testModelConfig
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -303,7 +292,6 @@ paths:
     get:
       operationId: listPlugins
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -324,7 +312,6 @@ paths:
     post:
       operationId: installPlugin
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -339,7 +326,7 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 4096
-                  description: Local directory visible to the Kern server.
+                  description: Slash-separated plugin directory relative to the configured Kern workspace.
                 enable:
                   type: boolean
                   default: false
@@ -366,7 +353,6 @@ paths:
     get:
       operationId: getPlugin
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -380,7 +366,6 @@ paths:
     delete:
       operationId: removePlugin
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "204":
@@ -393,7 +378,6 @@ paths:
     post:
       operationId: enablePlugin
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -412,7 +396,6 @@ paths:
     post:
       operationId: disablePlugin
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -429,7 +412,6 @@ paths:
     get:
       operationId: getTask
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -446,7 +428,6 @@ paths:
     get:
       operationId: streamTaskEvents
       security:
-        - sessionCookie: []
         - bearerAuth: []
       parameters:
         - name: Last-Event-ID
@@ -467,7 +448,6 @@ paths:
     post:
       operationId: submitTaskInput
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -505,7 +485,6 @@ paths:
     get:
       operationId: listPendingApprovals
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -528,7 +507,6 @@ paths:
     get:
       operationId: getCurrentTaskPlan
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -553,7 +531,6 @@ paths:
     get:
       operationId: listTaskVerifications
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -581,7 +558,6 @@ paths:
     get:
       operationId: listTaskPlugins
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -609,7 +585,6 @@ paths:
     get:
       operationId: listTaskArtifacts
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -634,7 +609,6 @@ paths:
     get:
       operationId: listUncertainOperations
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -665,7 +639,6 @@ paths:
     get:
       operationId: downloadTaskArtifact
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -685,7 +658,6 @@ paths:
     post:
       operationId: pauseTask
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -702,7 +674,6 @@ paths:
     post:
       operationId: cancelTask
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -719,7 +690,6 @@ paths:
     post:
       operationId: resumeTask
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "202":
@@ -736,7 +706,6 @@ paths:
     post:
       operationId: retryTask
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "202":
@@ -758,7 +727,6 @@ paths:
     post:
       operationId: decideApproval
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -794,7 +762,6 @@ paths:
     post:
       operationId: resolveUncertainOperation
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -823,7 +790,6 @@ paths:
     get:
       operationId: listEvaluationRuns
       security:
-        - sessionCookie: []
         - bearerAuth: []
       parameters:
         - name: limit
@@ -851,7 +817,6 @@ paths:
     post:
       operationId: startEvaluationRun
       security:
-        - sessionCookie: []
         - bearerAuth: []
       requestBody:
         required: true
@@ -874,7 +839,6 @@ paths:
     get:
       operationId: getEvaluationRun
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -891,7 +855,6 @@ paths:
     get:
       operationId: getEvaluationReport
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "200":
@@ -914,7 +877,6 @@ paths:
     post:
       operationId: cancelEvaluationRun
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "202":
@@ -931,7 +893,6 @@ paths:
     post:
       operationId: pauseEvaluationRun
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "202":
@@ -950,7 +911,6 @@ paths:
     post:
       operationId: resumeEvaluationRun
       security:
-        - sessionCookie: []
         - bearerAuth: []
       responses:
         "202":
@@ -965,13 +925,10 @@ paths:
           description: Run is not paused or its immutable inputs changed.
 components:
   securitySchemes:
-    sessionCookie:
-      type: apiKey
-      in: cookie
-      name: kern_session
     bearerAuth:
       type: http
       scheme: bearer
+      description: Persistent server token for SDK clients or a signed short-lived browser bootstrap token.
   parameters:
     TaskID:
       name: task_id
@@ -1100,6 +1057,7 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
+          description: Slash-separated suite path relative to the configured trusted evaluation root.
         variants:
           type: array
           uniqueItems: true

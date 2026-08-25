@@ -21,6 +21,8 @@ import (
 var (
 	errCancelledByUser = errors.New("evaluation cancelled by user")
 	errPausedByUser    = errors.New("evaluation paused by user")
+	// ErrClosed identifies work rejected after service shutdown begins.
+	ErrClosed = errors.New("evalservice: service is closed")
 )
 
 // Store is the durable evaluation persistence required by Service.
@@ -45,11 +47,25 @@ type runControl struct {
 	done   chan struct{}
 }
 
+// PluginResolver returns an already installed, trusted plugin package.
+type PluginResolver interface {
+	Get(ctx context.Context, pluginID string) (plugin.Installed, error)
+}
+
 // Config fixes service-owned storage, concurrency, and agent runtime limits.
 type Config struct {
-	DataRoot      string
-	Store         Store
-	PluginSources map[string]string
+	DataRoot string
+	EvalRoot string
+	// EvalRootHandle is a stable, pre-opened evaluation root. The caller keeps
+	// ownership and must keep it open until Service.Close returns.
+	EvalRootHandle *os.Root
+	Store          Store
+	PluginSources  map[string]string
+	PluginResolver PluginResolver
+	// WritableRoots are host workspaces writable by a primary agent. When
+	// evaluation is enabled, neither trusted suite inputs nor frozen run data
+	// may overlap any of these roots.
+	WritableRoots []string
 	MaxActive     int
 	MaxTurns      int
 	MaxToolCalls  int
@@ -64,18 +80,29 @@ type StartInput struct {
 
 // Service runs evaluations outside request lifetimes and persists every state.
 type Service struct {
-	root          string
-	store         Store
-	pluginSources map[string]string
-	maxTurns      int
-	maxToolCalls  int
-	logger        *slog.Logger
-	ctx           context.Context
-	cancel        context.CancelFunc
-	sem           chan struct{}
-	mu            sync.Mutex
-	controls      map[string]*runControl
-	wg            sync.WaitGroup
+	root           string
+	inputRoot      string
+	workspaceRoot  string
+	runtimeRoot    string
+	evalRoot       string
+	evalRootHandle *os.Root
+	ownsEvalRoot   bool
+	store          Store
+	pluginSources  map[string]string
+	pluginResolver PluginResolver
+	maxTurns       int
+	maxToolCalls   int
+	logger         *slog.Logger
+	ctx            context.Context
+	cancel         context.CancelFunc
+	sem            chan struct{}
+	lifecycleMu    sync.Mutex
+	closed         bool
+	closeOnce      sync.Once
+	closeDone      chan struct{}
+	mu             sync.Mutex
+	controls       map[string]*runControl
+	wg             sync.WaitGroup
 }
 
 // New creates a service and marks runs interrupted by an earlier process as failed.
@@ -90,6 +117,60 @@ func New(ctx context.Context, config Config) (*Service, error) {
 	if err := os.MkdirAll(absolute, 0o700); err != nil {
 		return nil, fmt.Errorf("evalservice: creating data root: %w", err)
 	}
+	absolute, err = filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("evalservice: resolving data root links: %w", err)
+	}
+	if err := os.Chmod(absolute, 0o700); err != nil {
+		return nil, fmt.Errorf("evalservice: restricting data root: %w", err)
+	}
+	evalRoot := ""
+	evalRootHandle := config.EvalRootHandle
+	ownsEvalRoot := false
+	if evalRootHandle != nil {
+		evalRoot = evalRootHandle.Name()
+	} else if strings.TrimSpace(config.EvalRoot) != "" {
+		evalRoot, err = filepath.Abs(config.EvalRoot)
+		if err != nil {
+			return nil, fmt.Errorf("evalservice: resolving evaluation root: %w", err)
+		}
+		evalRootHandle, err = os.OpenRoot(evalRoot)
+		if err != nil {
+			return nil, fmt.Errorf("evalservice: opening evaluation root: %w", err)
+		}
+		ownsEvalRoot = true
+	}
+	if evalRootHandle != nil {
+		if err := requireSeparatedRoots(evalRootHandle, absolute); err != nil {
+			if ownsEvalRoot {
+				_ = evalRootHandle.Close()
+			}
+			return nil, err
+		}
+		if err := requireWritableRootSeparation(evalRootHandle, absolute, config.WritableRoots); err != nil {
+			if ownsEvalRoot {
+				_ = evalRootHandle.Close()
+			}
+			return nil, err
+		}
+	}
+	inputRoot := filepath.Join(absolute, "inputs")
+	workspaceRoot := filepath.Join(absolute, "workspaces")
+	runtimeRoot := filepath.Join(absolute, "runtime")
+	for _, directory := range []string{inputRoot, workspaceRoot, runtimeRoot} {
+		if err := ensurePrivateDirectory(directory); err != nil {
+			if ownsEvalRoot {
+				_ = evalRootHandle.Close()
+			}
+			return nil, err
+		}
+	}
+	if err := requirePairwiseSeparated(inputRoot, workspaceRoot, runtimeRoot); err != nil {
+		if ownsEvalRoot {
+			_ = evalRootHandle.Close()
+		}
+		return nil, err
+	}
 	if config.MaxActive < 1 {
 		config.MaxActive = 1
 	}
@@ -98,14 +179,21 @@ func New(ctx context.Context, config Config) (*Service, error) {
 	}
 	serviceCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	service := &Service{
-		root: absolute, store: config.Store,
-		pluginSources: copySources(config.PluginSources),
-		maxTurns:      config.MaxTurns, maxToolCalls: config.MaxToolCalls,
+		root: absolute, inputRoot: inputRoot, workspaceRoot: workspaceRoot, runtimeRoot: runtimeRoot,
+		evalRoot: evalRoot, evalRootHandle: evalRootHandle, ownsEvalRoot: ownsEvalRoot,
+		store:          config.Store,
+		pluginSources:  copySources(config.PluginSources),
+		pluginResolver: config.PluginResolver,
+		maxTurns:       config.MaxTurns, maxToolCalls: config.MaxToolCalls,
 		logger: config.Logger, ctx: serviceCtx, cancel: cancel,
-		sem: make(chan struct{}, config.MaxActive), controls: make(map[string]*runControl),
+		sem: make(chan struct{}, config.MaxActive), closeDone: make(chan struct{}),
+		controls: make(map[string]*runControl),
 	}
 	if err := service.recoverInterrupted(ctx); err != nil {
 		cancel()
+		if service.ownsEvalRoot {
+			_ = service.evalRootHandle.Close()
+		}
 		return nil, err
 	}
 	return service, nil
@@ -113,22 +201,42 @@ func New(ctx context.Context, config Config) (*Service, error) {
 
 // Close cancels active runs and waits until their terminal state is persisted.
 func (s *Service) Close() {
-	s.cancel()
-	s.mu.Lock()
-	for _, control := range s.controls {
-		control.cancel(context.Canceled)
-	}
-	s.mu.Unlock()
-	s.wg.Wait()
+	s.closeOnce.Do(func() {
+		s.lifecycleMu.Lock()
+		s.closed = true
+		s.cancel()
+		s.mu.Lock()
+		for _, control := range s.controls {
+			control.cancel(context.Canceled)
+		}
+		s.mu.Unlock()
+		s.lifecycleMu.Unlock()
+
+		s.wg.Wait()
+		if s.ownsEvalRoot && s.evalRootHandle != nil {
+			_ = s.evalRootHandle.Close()
+			s.evalRootHandle = nil
+		}
+		close(s.closeDone)
+	})
+	<-s.closeDone
 }
 
 // Start validates and durably queues a new asynchronous evaluation.
 func (s *Service) Start(ctx context.Context, input StartInput) (evaluation.Run, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closed {
+		return evaluation.Run{}, ErrClosed
+	}
 	input.SuitePath = strings.TrimSpace(input.SuitePath)
 	if input.SuitePath == "" || len(input.SuitePath) > 4_096 {
 		return evaluation.Run{}, errors.New("evalservice: suite_path is required")
 	}
-	suite, err := evaluation.Load(input.SuitePath)
+	if s.evalRootHandle == nil {
+		return evaluation.Run{}, errors.New("evalservice: evaluation root is not configured")
+	}
+	suite, err := evaluation.LoadFromRootHandle(s.evalRootHandle, input.SuitePath)
 	if err != nil {
 		return evaluation.Run{}, err
 	}
@@ -136,15 +244,31 @@ func (s *Service) Start(ctx context.Context, input StartInput) (evaluation.Run, 
 	if err != nil {
 		return evaluation.Run{}, err
 	}
-	runner, err := s.prepareRunner(&suite, variants)
-	if err != nil {
-		return evaluation.Run{}, err
-	}
-	configDigest, _, err := evaluation.PrepareRun(suite, variants)
+	runner, err := s.prepareRunner(ctx, &suite, variants)
 	if err != nil {
 		return evaluation.Run{}, err
 	}
 	runID, err := id.New()
+	if err != nil {
+		return evaluation.Run{}, err
+	}
+	snapshotPath := filepath.Join(s.inputRoot, runID)
+	snapshot, err := evaluation.Snapshot(
+		ctx,
+		suite,
+		snapshotPath,
+	)
+	if err != nil {
+		return evaluation.Run{}, err
+	}
+	closeSnapshot := true
+	defer func() {
+		if closeSnapshot {
+			_ = snapshot.Close()
+			_ = os.RemoveAll(snapshotPath)
+		}
+	}()
+	configDigest, _, err := evaluation.PrepareRunContext(ctx, snapshot, variants)
 	if err != nil {
 		return evaluation.Run{}, err
 	}
@@ -155,19 +279,16 @@ func (s *Service) Start(ctx context.Context, input StartInput) (evaluation.Run, 
 		Status: evaluation.StatusQueued, Variants: variants, ConfigDigest: configDigest,
 		CaseCount: len(suite.Cases) * len(variants), CreatedAt: now,
 	}
-	absoluteSuitePath, err := filepath.Abs(input.SuitePath)
-	if err != nil {
-		return evaluation.Run{}, fmt.Errorf("evalservice: resolving suite path: %w", err)
-	}
-	config := evaluation.RunConfig{SuitePath: absoluteSuitePath, Variants: variants}
-	if err := s.store.UpsertEvalSuite(ctx, suite); err != nil {
+	config := evaluation.RunConfig{SuitePath: input.SuitePath, Variants: variants}
+	if err := s.store.UpsertEvalSuite(ctx, snapshot); err != nil {
 		return evaluation.Run{}, err
 	}
 	if err := s.store.CreateEvalRun(ctx, run, config); err != nil {
 		return evaluation.Run{}, err
 	}
 
-	s.launch(run, suite, variants, runner, nil)
+	s.launch(run, snapshot, variants, runner, nil)
+	closeSnapshot = false
 	return run, nil
 }
 
@@ -197,6 +318,14 @@ func (s *Service) Pause(ctx context.Context, runID string) (evaluation.Run, erro
 // Resume validates the original execution identity and queues only jobs that
 // do not already have atomically persisted results.
 func (s *Service) Resume(ctx context.Context, runID string) (evaluation.Run, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closed {
+		return evaluation.Run{}, ErrClosed
+	}
+	if s.evalRootHandle == nil {
+		return evaluation.Run{}, errors.New("evalservice: evaluation root is not configured")
+	}
 	current, err := s.store.GetEvalRun(ctx, runID)
 	if err != nil {
 		return evaluation.Run{}, err
@@ -212,18 +341,24 @@ func (s *Service) Resume(ctx context.Context, runID string) (evaluation.Run, err
 	if err != nil {
 		return evaluation.Run{}, err
 	}
-	suite, err := evaluation.Load(config.SuitePath)
+	suite, err := evaluation.LoadFromRoot(filepath.Join(s.inputRoot, runID), "suite.json")
 	if err != nil {
 		return evaluation.Run{}, err
 	}
+	closeSnapshot := true
+	defer func() {
+		if closeSnapshot {
+			_ = suite.Close()
+		}
+	}()
 	if suite.ID != current.SuiteID || suite.Version != current.SuiteVersion {
 		return evaluation.Run{}, errors.New("evalservice: suite identity changed while paused")
 	}
-	runner, err := s.prepareRunner(&suite, config.Variants)
+	runner, err := s.prepareRunner(ctx, &suite, config.Variants)
 	if err != nil {
 		return evaluation.Run{}, err
 	}
-	digest, _, err := evaluation.PrepareRun(suite, config.Variants)
+	digest, _, err := evaluation.PrepareRunContext(ctx, suite, config.Variants)
 	if err != nil {
 		return evaluation.Run{}, err
 	}
@@ -235,8 +370,12 @@ func (s *Service) Resume(ctx context.Context, runID string) (evaluation.Run, err
 	}
 	current.Status = evaluation.StatusQueued
 	current.ErrorMessage = ""
+	current.CompletedAt = nil
 	s.launch(current, suite, config.Variants, runner, prior)
-	return s.store.GetEvalRun(ctx, runID)
+	closeSnapshot = false
+	// Resume admits asynchronous work just like Start. Return that stable queued
+	// snapshot instead of racing the worker with another store read.
+	return current, nil
 }
 
 // Cancel requests cancellation and returns the latest durable snapshot.
@@ -279,6 +418,7 @@ func (s *Service) execute(
 	control *runControl,
 ) {
 	defer s.wg.Done()
+	defer suite.Close()
 	defer func() {
 		s.mu.Lock()
 		if s.controls[run.ID] == control {
@@ -324,6 +464,18 @@ func (s *Service) execute(
 			context.WithoutCancel(ctx), run.ID, evaluation.StatusFailed, err.Error(), time.Now().UTC(),
 		); finishErr != nil {
 			s.logger.Error("evaluation failure persistence failed", "run_id", run.ID, "error", finishErr)
+		}
+		return
+	}
+	if report.ConfigDigest != run.ConfigDigest {
+		if finishErr := s.store.FinishEvalRun(
+			context.WithoutCancel(ctx),
+			run.ID,
+			evaluation.StatusFailed,
+			"evaluation input snapshot changed during execution",
+			time.Now().UTC(),
+		); finishErr != nil {
+			s.logger.Error("evaluation snapshot mismatch persistence failed", "run_id", run.ID, "error", finishErr)
 		}
 		return
 	}
@@ -386,8 +538,12 @@ func (s *Service) finishCancelled(runID string, cause error) {
 	}
 }
 
-func (s *Service) prepareRunner(suite *evaluation.Suite, variants []string) (*evaluation.Runner, error) {
-	sources, err := s.resolveSources(*suite, variants)
+func (s *Service) prepareRunner(
+	ctx context.Context,
+	suite *evaluation.Suite,
+	variants []string,
+) (*evaluation.Runner, error) {
+	sources, err := s.resolveSources(ctx, *suite, variants)
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +551,7 @@ func (s *Service) prepareRunner(suite *evaluation.Suite, variants []string) (*ev
 		return nil, err
 	}
 	agent, err := evalrunner.NewKernAgent(evalrunner.Config{
-		DataRoot: filepath.Join(s.root, "runtime"), PluginSources: sources,
+		DataRoot: s.runtimeRoot, PluginSources: sources,
 		MaxTurns: s.maxTurns, MaxToolCalls: s.maxToolCalls, Logger: s.logger,
 	})
 	if err != nil {
@@ -408,7 +564,7 @@ func (s *Service) prepareRunner(suite *evaluation.Suite, variants []string) (*ev
 			return nil, err
 		}
 	}
-	return evaluation.NewRunnerWithJudge(filepath.Join(s.root, "workspaces"), agent, judge, s.logger)
+	return evaluation.NewRunnerWithJudge(s.workspaceRoot, agent, judge, s.logger)
 }
 
 func (s *Service) recoverInterrupted(ctx context.Context) error {
@@ -429,7 +585,11 @@ func (s *Service) recoverInterrupted(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) resolveSources(suite evaluation.Suite, selected []string) (map[string]string, error) {
+func (s *Service) resolveSources(
+	ctx context.Context,
+	suite evaluation.Suite,
+	selected []string,
+) (map[string]string, error) {
 	sources := copySources(s.pluginSources)
 	wanted := make(map[string]bool, len(selected))
 	for _, variantID := range selected {
@@ -441,28 +601,17 @@ func (s *Service) resolveSources(suite evaluation.Suite, selected []string) (map
 		}
 		for _, reference := range variant.Plugins {
 			pluginID, _, _ := strings.Cut(reference, "@")
-			if sources[pluginID] != "" {
-				continue
-			}
-			for _, root := range pluginSearchRoots(suite.Root) {
-				entries, _ := os.ReadDir(root)
-				for _, entry := range entries {
-					if !entry.IsDir() {
-						continue
-					}
-					candidate := filepath.Join(root, entry.Name())
-					manifest, _, err := plugin.LoadManifest(candidate)
-					if err == nil && manifest.ID == pluginID {
-						sources[pluginID] = candidate
-						break
-					}
+			if sources[pluginID] == "" && s.pluginResolver != nil {
+				installed, err := s.pluginResolver.Get(ctx, pluginID)
+				if err != nil && !errors.Is(err, plugin.ErrNotFound) {
+					return nil, fmt.Errorf("evalservice: resolving installed plugin %s: %w", pluginID, err)
 				}
-				if sources[pluginID] != "" {
-					break
+				if err == nil {
+					sources[pluginID] = strings.TrimSpace(installed.InstallPath)
 				}
 			}
 			if sources[pluginID] == "" {
-				return nil, fmt.Errorf("evalservice: no local source for plugin %s", reference)
+				return nil, fmt.Errorf("evalservice: no trusted source configured for plugin %s", reference)
 			}
 		}
 	}
@@ -498,19 +647,151 @@ func selectedVariantIDs(suite evaluation.Suite, selected []string) ([]string, er
 	return result, nil
 }
 
-func pluginSearchRoots(suiteRoot string) []string {
-	workingDirectory, _ := os.Getwd()
-	return []string{
-		filepath.Join(workingDirectory, "plugins"),
-		filepath.Join(suiteRoot, "plugins"),
-		filepath.Join(suiteRoot, "..", "..", "plugins"),
-	}
-}
-
 func copySources(source map[string]string) map[string]string {
 	result := make(map[string]string, len(source))
 	for pluginID, directory := range source {
 		result[pluginID] = directory
 	}
 	return result
+}
+
+func ensurePrivateDirectory(directory string) error {
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			return fmt.Errorf("evalservice: creating private directory: %w", err)
+		}
+		info, err = os.Lstat(directory)
+	}
+	if err != nil {
+		return fmt.Errorf("evalservice: inspecting private directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("evalservice: evaluation storage contains an unsafe directory")
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		return fmt.Errorf("evalservice: restricting private directory: %w", err)
+	}
+	return nil
+}
+
+func requireSeparatedRoots(evalRoot *os.Root, dataRoot string) error {
+	evalPath, err := stableRootPath(evalRoot)
+	if err != nil {
+		return err
+	}
+	overlap, err := rootsOverlap(evalPath, dataRoot)
+	if err != nil {
+		return err
+	}
+	if overlap {
+		return errors.New("evalservice: evaluation and data roots must not overlap")
+	}
+	return nil
+}
+
+func requireWritableRootSeparation(evalRoot *os.Root, dataRoot string, writableRoots []string) error {
+	evalPath, err := stableRootPath(evalRoot)
+	if err != nil {
+		return err
+	}
+	for _, writableRoot := range writableRoots {
+		writableRoot = strings.TrimSpace(writableRoot)
+		if writableRoot == "" {
+			return errors.New("evalservice: writable root is required")
+		}
+		absolute, err := filepath.Abs(writableRoot)
+		if err != nil {
+			return fmt.Errorf("evalservice: resolving writable root: %w", err)
+		}
+		overlap, err := rootsOverlap(evalPath, absolute)
+		if err != nil {
+			return fmt.Errorf("evalservice: comparing evaluation and writable roots: %w", err)
+		}
+		if overlap {
+			return errors.New("evalservice: evaluation root and writable agent roots must not overlap")
+		}
+		overlap, err = rootsOverlap(dataRoot, absolute)
+		if err != nil {
+			return fmt.Errorf("evalservice: comparing data and writable roots: %w", err)
+		}
+		if overlap {
+			return errors.New("evalservice: data root and writable agent roots must not overlap")
+		}
+	}
+	return nil
+}
+
+func stableRootPath(root *os.Root) (string, error) {
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return "", fmt.Errorf("evalservice: inspecting evaluation root: %w", err)
+	}
+	rootPath, err := filepath.EvalSymlinks(root.Name())
+	if err != nil {
+		return "", fmt.Errorf("evalservice: resolving evaluation root links: %w", err)
+	}
+	pathInfo, err := os.Stat(rootPath)
+	if err != nil {
+		return "", fmt.Errorf("evalservice: inspecting evaluation root path: %w", err)
+	}
+	if !os.SameFile(rootInfo, pathInfo) {
+		return "", errors.New("evalservice: evaluation root identity changed before initialization")
+	}
+	return rootPath, nil
+}
+
+func requirePairwiseSeparated(directories ...string) error {
+	for left := range directories {
+		for right := left + 1; right < len(directories); right++ {
+			overlap, err := rootsOverlap(directories[left], directories[right])
+			if err != nil {
+				return err
+			}
+			if overlap {
+				return errors.New("evalservice: snapshot, workspace, and runtime roots must be separate")
+			}
+		}
+	}
+	return nil
+}
+
+func rootsOverlap(left, right string) (bool, error) {
+	leftPath, err := filepath.EvalSymlinks(left)
+	if err != nil {
+		return false, fmt.Errorf("evalservice: resolving root links: %w", err)
+	}
+	rightPath, err := filepath.EvalSymlinks(right)
+	if err != nil {
+		return false, fmt.Errorf("evalservice: resolving root links: %w", err)
+	}
+	leftInfo, err := os.Stat(leftPath)
+	if err != nil {
+		return false, fmt.Errorf("evalservice: inspecting root: %w", err)
+	}
+	rightInfo, err := os.Stat(rightPath)
+	if err != nil {
+		return false, fmt.Errorf("evalservice: inspecting root: %w", err)
+	}
+	if os.SameFile(leftInfo, rightInfo) || pathContains(leftPath, rightPath) || pathContains(rightPath, leftPath) {
+		return true, nil
+	}
+	return ancestorHasIdentity(leftPath, rightInfo) || ancestorHasIdentity(rightPath, leftInfo), nil
+}
+
+func pathContains(parent, child string) bool {
+	relative, err := filepath.Rel(parent, child)
+	return err == nil && (relative == "." || filepath.IsLocal(relative))
+}
+
+func ancestorHasIdentity(start string, target os.FileInfo) bool {
+	for current := filepath.Clean(start); ; current = filepath.Dir(current) {
+		if info, err := os.Stat(current); err == nil && os.SameFile(info, target) {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
 }

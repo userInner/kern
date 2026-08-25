@@ -20,9 +20,9 @@ server. Enable them in the configuration file:
 ```
 
 `KERN_METRICS_ENABLED=true` has higher precedence than the configuration file.
-The endpoint is `GET /metrics` and requires the same session cookie or bearer
-token as the task API. A disabled endpoint returns `404`; a request without a
-valid session returns `401`. Responses are never cached.
+The endpoint is `GET /metrics` and requires the same bearer authentication as
+the task API. A disabled endpoint returns `404`; a request without a valid
+token returns `401`. Responses are never cached.
 
 The Go and TypeScript SDKs expose this endpoint through `Client.Metrics` and
 `KernClient.metrics` respectively.
@@ -98,4 +98,6 @@ The model adapter additionally redacts its exact resolved API-key value from
 complete and streaming provider output, tool arguments, response metadata, and
 provider error bodies before those values reach events or logs.
 Errors returned to HTTP clients remain bounded generic problems; detailed local
-errors are correlated through `trace_id`.
+HTTP handler causes are intentionally not logged because adapter errors may
+contain credentials. A fixed `error_kind` and `trace_id` retain request-level
+correlation without copying an untrusted error string into the log.

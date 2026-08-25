@@ -24,9 +24,9 @@ const (
 	ManifestFile     = "kern.plugin.json"
 	CoreVersion      = "0.1.0"
 	HostIDPrefix     = "host."
-	maxManifestBytes = 256 << 10
-	maxPackageFiles  = 2_000
-	maxPackageBytes  = 128 << 20
+	MaxManifestBytes = 256 << 10
+	MaxPackageFiles  = 2_000
+	MaxPackageBytes  = 128 << 20
 )
 
 var (
@@ -96,16 +96,34 @@ type Installed struct {
 
 // LoadManifest strictly decodes and validates a plugin manifest.
 func LoadManifest(directory string) (Manifest, []byte, error) {
-	file, err := os.Open(filepath.Join(directory, ManifestFile))
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return Manifest{}, nil, fmt.Errorf("plugin: resolving package directory: %w", err)
+	}
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return Manifest{}, nil, fmt.Errorf("plugin: opening package directory: %w", err)
+	}
+	manifest, data, loadErr := LoadManifestRoot(root)
+	return manifest, data, errors.Join(loadErr, root.Close())
+}
+
+// LoadManifestRoot strictly decodes and validates a manifest beneath an
+// already trusted package root. The manifest itself may not be a symbolic link.
+func LoadManifestRoot(directory *os.Root) (Manifest, []byte, error) {
+	if directory == nil {
+		return Manifest{}, nil, errors.New("plugin: package root is required")
+	}
+	file, _, err := openRootRegularFile(directory, ManifestFile)
 	if err != nil {
 		return Manifest{}, nil, fmt.Errorf("plugin: opening manifest: %w", err)
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxManifestBytes+1))
+	data, err := io.ReadAll(io.LimitReader(file, MaxManifestBytes+1))
 	if err != nil {
 		return Manifest{}, nil, fmt.Errorf("plugin: reading manifest: %w", err)
 	}
-	if len(data) > maxManifestBytes {
+	if len(data) > MaxManifestBytes {
 		return Manifest{}, nil, fmt.Errorf("%w: manifest exceeds 256 KiB", ErrInvalidManifest)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -209,8 +227,10 @@ func (e Entrypoints) all() []string {
 }
 
 func validateRelativePath(value string) error {
-	if value == "" || strings.Contains(value, "\\") || path.IsAbs(value) || path.Clean(value) != value ||
-		value == "." || strings.HasPrefix(value, "../") || strings.ContainsRune(value, 0) {
+	native := filepath.FromSlash(value)
+	if value == "" || strings.ContainsAny(value, `\:`) || path.IsAbs(value) || path.Clean(value) != value ||
+		value == "." || strings.HasPrefix(value, "../") || strings.ContainsRune(value, 0) ||
+		!filepath.IsLocal(native) {
 		return fmt.Errorf("%w: unsafe entrypoint path %q", ErrInvalidManifest, value)
 	}
 	return nil
@@ -218,62 +238,74 @@ func validateRelativePath(value string) error {
 
 // PackageDigest hashes every regular package file except the self-referential manifest.
 func PackageDigest(directory string) (string, error) {
-	directory, err := filepath.Abs(directory)
+	absolute, err := filepath.Abs(directory)
 	if err != nil {
 		return "", fmt.Errorf("plugin: resolving package directory: %w", err)
+	}
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return "", fmt.Errorf("plugin: opening package directory: %w", err)
+	}
+	digest, digestErr := PackageDigestRoot(root)
+	return digest, errors.Join(digestErr, root.Close())
+}
+
+// PackageDigestRoot hashes every regular file reachable beneath an already
+// trusted package root. Symbolic links are rejected at every path component.
+func PackageDigestRoot(directory *os.Root) (string, error) {
+	if directory == nil {
+		return "", errors.New("plugin: package root is required")
 	}
 	type entry struct {
 		path   string
 		digest [sha256.Size]byte
-		size   int64
 	}
 	entries := make([]entry, 0)
 	var total int64
-	err = filepath.WalkDir(directory, func(filePath string, item fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(directory.FS(), ".", func(filePath string, item fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		relative, err := filepath.Rel(directory, filePath)
-		if err != nil {
-			return err
-		}
-		if relative == "." {
+		if filePath == "." {
 			return nil
 		}
+		native := filepath.FromSlash(filePath)
+		if !filepath.IsLocal(native) || strings.ContainsRune(native, 0) {
+			return fmt.Errorf("plugin: package path is not local: %q", filePath)
+		}
 		if item.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("plugin: symbolic links are not allowed: %s", relative)
+			return fmt.Errorf("plugin: symbolic links are not allowed: %s", filePath)
 		}
 		if item.IsDir() {
 			return nil
 		}
 		if !item.Type().IsRegular() {
-			return fmt.Errorf("plugin: non-regular file is not allowed: %s", relative)
+			return fmt.Errorf("plugin: non-regular file is not allowed: %s", filePath)
 		}
-		relative = filepath.ToSlash(relative)
-		if relative == ManifestFile {
+		if filePath == ManifestFile {
 			return nil
 		}
-		info, err := item.Info()
-		if err != nil {
-			return err
-		}
-		total += info.Size()
-		if len(entries) >= maxPackageFiles || total > maxPackageBytes {
+		if len(entries) >= MaxPackageFiles {
 			return errors.New("plugin: package exceeds file or byte limit")
 		}
-		file, err := os.Open(filePath)
+		file, _, err := openRootRegularFile(directory, native)
 		if err != nil {
 			return err
 		}
 		hash := sha256.New()
-		_, copyErr := io.Copy(hash, file)
+		remaining := int64(MaxPackageBytes) - total
+		copied, copyErr := io.Copy(hash, io.LimitReader(file, remaining+1))
 		closeErr := file.Close()
 		if err := errors.Join(copyErr, closeErr); err != nil {
 			return err
 		}
+		if copied > remaining {
+			return errors.New("plugin: package exceeds file or byte limit")
+		}
+		total += copied
 		var digest [sha256.Size]byte
 		copy(digest[:], hash.Sum(nil))
-		entries = append(entries, entry{path: relative, digest: digest, size: info.Size()})
+		entries = append(entries, entry{path: filePath, digest: digest})
 		return nil
 	})
 	if err != nil {
@@ -292,16 +324,40 @@ func PackageDigest(directory string) (string, error) {
 
 // VerifyPackage verifies integrity and every declared entrypoint.
 func VerifyPackage(directory string, manifest Manifest) (string, error) {
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return "", fmt.Errorf("plugin: resolving package directory: %w", err)
+	}
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return "", fmt.Errorf("plugin: opening package directory: %w", err)
+	}
+	digest, verifyErr := VerifyPackageRoot(root, manifest)
+	return digest, errors.Join(verifyErr, root.Close())
+}
+
+// VerifyPackageRoot verifies a package beneath an already trusted root.
+func VerifyPackageRoot(directory *os.Root, manifest Manifest) (string, error) {
+	if directory == nil {
+		return "", errors.New("plugin: package root is required")
+	}
+	if err := ValidateManifest(manifest); err != nil {
+		return "", err
+	}
 	for _, relative := range manifest.Entrypoints.all() {
-		info, err := os.Lstat(filepath.Join(directory, filepath.FromSlash(relative)))
+		native := filepath.FromSlash(relative)
+		if !filepath.IsLocal(native) || strings.ContainsRune(native, 0) {
+			return "", fmt.Errorf("%w: unsafe entrypoint path %q", ErrInvalidManifest, relative)
+		}
+		info, err := rootInfoWithoutSymlinks(directory, native)
 		if err != nil {
 			return "", fmt.Errorf("%w: entrypoint %q: %v", ErrInvalidManifest, relative, err)
 		}
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		if !info.Mode().IsRegular() {
 			return "", fmt.Errorf("%w: entrypoint %q is not a regular file", ErrInvalidManifest, relative)
 		}
 	}
-	digest, err := PackageDigest(directory)
+	digest, err := PackageDigestRoot(directory)
 	if err != nil {
 		return "", err
 	}
@@ -309,6 +365,66 @@ func VerifyPackage(directory string, manifest Manifest) (string, error) {
 		return "", fmt.Errorf("%w: got %s, want %s", ErrIntegrity, digest, manifest.Integrity.Files)
 	}
 	return digest, nil
+}
+
+func openRootRegularFile(root *os.Root, relative string) (*os.File, fs.FileInfo, error) {
+	info, err := rootInfoWithoutSymlinks(root, relative)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("non-regular file is not allowed: %s", relative)
+	}
+	file, err := root.Open(relative)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, statErr := file.Stat()
+	current, lstatErr := root.Lstat(relative)
+	if err := errors.Join(statErr, lstatErr); err != nil {
+		return nil, nil, errors.Join(err, file.Close())
+	}
+	if current.Mode()&os.ModeSymlink != 0 {
+		return nil, nil, errors.Join(
+			fmt.Errorf("symbolic links are not allowed: %s", relative),
+			file.Close(),
+		)
+	}
+	if !opened.Mode().IsRegular() || !current.Mode().IsRegular() ||
+		!os.SameFile(info, opened) || !os.SameFile(opened, current) {
+		return nil, nil, errors.Join(
+			fmt.Errorf("package file changed while opening: %s", relative),
+			file.Close(),
+		)
+	}
+	return file, opened, nil
+}
+
+func rootInfoWithoutSymlinks(root *os.Root, relative string) (fs.FileInfo, error) {
+	if root == nil {
+		return nil, errors.New("plugin: package root is required")
+	}
+	if relative == "" || !filepath.IsLocal(relative) || strings.ContainsRune(relative, 0) {
+		return nil, fmt.Errorf("path is not local: %q", relative)
+	}
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	current := ""
+	var info fs.FileInfo
+	for index, part := range parts {
+		current = filepath.Join(current, filepath.FromSlash(part))
+		var err error
+		info, err = root.Lstat(current)
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("symbolic links are not allowed: %s", current)
+		}
+		if index < len(parts)-1 && !info.IsDir() {
+			return nil, fmt.Errorf("non-directory path component: %s", current)
+		}
+	}
+	return info, nil
 }
 
 // Compatible evaluates the supported v1 range form: >=x.y.z <x.y.z.

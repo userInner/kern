@@ -36,7 +36,7 @@ func NewCompatibleJudge(config evaluation.JudgeConfig) (*CompatibleJudge, error)
 	if config.APIKeyEnv != "" {
 		value, ok := os.LookupEnv(config.APIKeyEnv)
 		if !ok || strings.TrimSpace(value) == "" {
-			return nil, fmt.Errorf("evalrunner: model judge secret %s is unavailable", config.APIKeyEnv)
+			return nil, errors.New("evalrunner: model judge credential is unavailable")
 		}
 		apiKey = value
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -183,6 +184,100 @@ func TestManagerCancelsApprovedOperationWhenExecutionContextStops(t *testing.T) 
 	if err != nil || resumed.Status != task.StatusRunning {
 		t.Fatalf("resumed task = %#v, %v", resumed, err)
 	}
+}
+
+func TestManagerCleansPendingApprovalWhenOperationReadIsCancelled(t *testing.T) {
+	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "kern.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	item, err := store.CreateTask(t.Context(), "authorize", "change a file")
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if err := store.Transition(t.Context(), item.ID, task.StatusPlanning, "", ""); err != nil {
+		t.Fatalf("Transition(planning) error = %v", err)
+	}
+	if err := store.Transition(t.Context(), item.ID, task.StatusRunning, "", ""); err != nil {
+		t.Fatalf("Transition(running) error = %v", err)
+	}
+	item, err = store.GetTask(t.Context(), item.ID)
+	if err != nil {
+		t.Fatalf("GetTask() error = %v", err)
+	}
+	op, _, err := store.CreateOperation(
+		t.Context(),
+		item.ID,
+		"change",
+		"change-cancelled-read",
+		operation.EffectLocalWrite,
+		json.RawMessage(`{"action":"write_file","path":"note.txt","content":"ok"}`),
+	)
+	if err != nil {
+		t.Fatalf("CreateOperation() error = %v", err)
+	}
+	blockingStore := &cancelledOperationReadStore{
+		Store:   store,
+		entered: make(chan struct{}),
+	}
+	manager, err := New(blockingStore, policy.New(), Config{
+		ApprovalTTL: time.Minute,
+		PollPeriod:  time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	authorizeCtx, cancelAuthorize := context.WithCancel(t.Context())
+	resultCh := make(chan error, 1)
+	go func() {
+		_, authorizeErr := manager.Authorize(authorizeCtx, item, op)
+		resultCh <- authorizeErr
+	}()
+	select {
+	case <-blockingStore.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Authorize() did not start the operation status read")
+	}
+	cancelAuthorize()
+
+	select {
+	case authorizeErr := <-resultCh:
+		if !errors.Is(authorizeErr, context.Canceled) {
+			t.Fatalf("Authorize() error = %v", authorizeErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Authorize() did not stop after context cancellation")
+	}
+
+	resumed, err := store.GetTask(t.Context(), item.ID)
+	if err != nil || resumed.Status != task.StatusRunning {
+		t.Fatalf("resumed task = %#v, %v", resumed, err)
+	}
+	pending, err := store.PendingApprovals(t.Context(), item.ID)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("PendingApprovals() = %#v, %v", pending, err)
+	}
+	cancelled, err := store.GetOperation(t.Context(), op.ID)
+	if err != nil || cancelled.Status != operation.StatusCancelled {
+		t.Fatalf("cancelled operation = %#v, %v", cancelled, err)
+	}
+}
+
+type cancelledOperationReadStore struct {
+	*sqlite.Store
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *cancelledOperationReadStore) GetOperation(
+	ctx context.Context,
+	_ string,
+) (operation.Operation, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	return operation.Operation{}, ctx.Err()
 }
 
 func waitForApproval(t *testing.T, store *sqlite.Store, taskID string) approval.Request {
