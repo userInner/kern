@@ -125,6 +125,9 @@ func (m *Manager) waitForDecision(
 	for {
 		current, err := m.store.GetOperation(ctx, op.ID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return m.interruptApproval(ctx, item.ID, request.ID, op.ID)
+			}
 			return operation.Operation{}, err
 		}
 		switch current.Status {
@@ -141,17 +144,7 @@ func (m *Manager) waitForDecision(
 		}
 		select {
 		case <-ctx.Done():
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-			cancelErr := m.cancelInterruptedApproval(cleanupCtx, request.ID, op.ID)
-			resumeErr := m.returnToRunning(cleanupCtx, item.ID)
-			cancel()
-			if errors.Is(resumeErr, task.ErrInvalidTransition) {
-				resumeErr = nil
-			}
-			if cancelErr != nil || resumeErr != nil {
-				return operation.Operation{}, errors.Join(ctx.Err(), cancelErr, resumeErr)
-			}
-			return operation.Operation{}, ctx.Err()
+			return m.interruptApproval(ctx, item.ID, request.ID, op.ID)
 		case <-ticker.C:
 		case <-expires.C:
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
@@ -172,6 +165,22 @@ func (m *Manager) waitForDecision(
 			return operation.Operation{}, ErrExpired
 		}
 	}
+}
+
+func (m *Manager) interruptApproval(
+	ctx context.Context,
+	taskID string,
+	requestID string,
+	operationID string,
+) (operation.Operation, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	cancelErr := m.cancelInterruptedApproval(cleanupCtx, requestID, operationID)
+	resumeErr := m.returnToRunning(cleanupCtx, taskID)
+	if errors.Is(resumeErr, task.ErrInvalidTransition) {
+		resumeErr = nil
+	}
+	return operation.Operation{}, errors.Join(ctx.Err(), cancelErr, resumeErr)
 }
 
 // cancelInterruptedApproval closes the narrow race where a user approves an
