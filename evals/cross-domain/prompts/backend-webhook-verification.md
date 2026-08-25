@@ -1,0 +1,1 @@
+Repair `webhook.go`. Verify the documented `t=<unix>,v1=<hex>` webhook signature over `<timestamp>.<raw body>`, accept any valid `v1` among repeated signatures, reject malformed, future, expired, or tampered requests, and use constant-time digest comparison. Keep the public API and sentinel errors intact. Do not change tests or other files. Run `go test ./...`.

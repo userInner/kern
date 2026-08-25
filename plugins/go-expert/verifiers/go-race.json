@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "id": "go.race_all",
+  "description": "The race-enabled Go package suite passed through the Core execute tool when concurrency risk justified it.",
+  "type": "command",
+  "required": false,
+  "command": ["go", "test", "-race", "./..."]
+}

@@ -1,0 +1,39 @@
+{
+  "schema_version": "1",
+  "id": "kern.release.smoke",
+  "name": "Kern release smoke evaluation",
+  "version": "0.1.0",
+  "defaults": {
+    "timeout_ms": 60000,
+    "token_budget": 200000,
+    "cost_budget_micros": 0,
+    "retries": 0,
+    "worker_count": 1,
+    "allowed_commands": ["go"]
+  },
+  "variants": [
+    {
+      "id": "general.base",
+      "plugins": []
+    },
+    {
+      "id": "expert.go",
+      "plugins": ["dev.kern.go-expert@0.1.0"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "release.runtime-roundtrip",
+      "fixture": "fixtures/runtime-roundtrip",
+      "prompt": "prompts/runtime-roundtrip.md",
+      "graders": [
+        {
+          "id": "go.test-all",
+          "type": "command",
+          "required": true,
+          "command": ["go", "test", "./..."]
+        }
+      ]
+    }
+  ]
+}

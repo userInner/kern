@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "id": "go.vet_all",
+  "description": "Go vet passed across the module through the Core execute tool.",
+  "type": "command",
+  "required": false,
+  "command": ["go", "vet", "./..."]
+}

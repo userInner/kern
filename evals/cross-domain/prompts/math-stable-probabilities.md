@@ -1,0 +1,1 @@
+Repair `probability.py`. Implement numerically stable `logsumexp` and `softmax`, including empty input, very large magnitudes, one or multiple positive infinities, negative infinity, and NaN rejection. Returned probabilities must be finite, non-negative, and sum to one when a distribution exists. Do not change tests or other files. Run `python3 -m unittest -v`.

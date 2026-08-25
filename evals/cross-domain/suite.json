@@ -1,0 +1,100 @@
+{
+  "schema_version": "1",
+  "id": "kern.cross-domain.reference",
+  "name": "Kern cross-domain coding agent benchmark",
+  "version": "0.1.0",
+  "defaults": {
+    "timeout_ms": 180000,
+    "token_budget": 400000,
+    "cost_budget_micros": 2000000,
+    "retries": 0,
+    "worker_count": 2,
+    "allowed_commands": ["node", "go", "gofmt", "python3"]
+  },
+  "variants": [
+    {"id": "general.base", "plugins": []}
+  ],
+  "cases": [
+    {
+      "id": "frontend.sse-stream-decoder",
+      "fixture": "fixtures/frontend-sse-stream-decoder",
+      "prompt": "prompts/frontend-sse-stream-decoder.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["node", "--test"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["decoder.js"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "frontend.chat-reconciliation",
+      "fixture": "fixtures/frontend-chat-reconciliation",
+      "prompt": "prompts/frontend-chat-reconciliation.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["node", "--test"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["messages.js"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "frontend.latest-search",
+      "fixture": "fixtures/frontend-latest-search",
+      "prompt": "prompts/frontend-latest-search.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["node", "--test"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["search.js"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "backend.idempotent-transfer",
+      "fixture": "fixtures/backend-idempotent-transfer",
+      "prompt": "prompts/backend-idempotent-transfer.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["go", "test", "-race", "./..."]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["ledger.go"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "backend.webhook-verification",
+      "fixture": "fixtures/backend-webhook-verification",
+      "prompt": "prompts/backend-webhook-verification.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["go", "test", "./..."]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["webhook.go"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "backend.coalescing-cache",
+      "fixture": "fixtures/backend-coalescing-cache",
+      "prompt": "prompts/backend-coalescing-cache.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["go", "test", "-race", "./..."]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["cache.go"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "math.money-allocation",
+      "fixture": "fixtures/math-money-allocation",
+      "prompt": "prompts/math-money-allocation.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["python3", "-m", "unittest", "-v"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["allocation.py"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "math.stable-probabilities",
+      "fixture": "fixtures/math-stable-probabilities",
+      "prompt": "prompts/math-stable-probabilities.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["python3", "-m", "unittest", "-v"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["probability.py"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    },
+    {
+      "id": "math.amortization",
+      "fixture": "fixtures/math-amortization",
+      "prompt": "prompts/math-amortization.md",
+      "graders": [
+        {"id": "behavior.tests", "type": "command", "required": true, "command": ["python3", "-m", "unittest", "-v"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["amortization.py"], "min_changed_files": 1, "max_changed_files": 1}
+      ]
+    }
+  ]
+}

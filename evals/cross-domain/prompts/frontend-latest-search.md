@@ -1,0 +1,1 @@
+Repair `search.js`. The search controller must abort the previous request when a new search starts, allow only the latest request to update state, treat aborts as non-errors, expose the latest non-abort error, and prevent callers from mutating internal state through `snapshot()`. Do not change tests or other files. Run `node --test`.

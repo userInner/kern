@@ -1,0 +1,2013 @@
+openapi: 3.1.0
+info:
+  title: Kern Core API
+  version: 0.1.0
+  description: Initial task lifecycle and persisted-event API.
+servers:
+  - url: http://127.0.0.1:8787
+paths:
+  /api/v1/health:
+    get:
+      operationId: getHealth
+      responses:
+        "200":
+          description: Runtime health and execution mode.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /api/v1/ready:
+    get:
+      operationId: getReadiness
+      responses:
+        "200":
+          description: Runtime dependencies are ready to serve requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, status, mode]
+                properties:
+                  schema_version:
+                    type: string
+                  status:
+                    type: string
+                    const: ready
+                  mode:
+                    type: string
+        "503":
+          description: A required runtime dependency is unavailable.
+  /metrics:
+    get:
+      operationId: getPrometheusMetrics
+      description: Available only when observability.metrics_enabled is true. Labels use Core-controlled low-cardinality vocabularies.
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Restart-safe metrics derived from the durable task ledger plus bounded process gauges.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: Authentication is required.
+        "404":
+          description: Metrics are disabled.
+  /api/v1/settings:
+    get:
+      operationId: getRuntimeSettings
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Public-safe defaults used by future task executions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeSettings"
+        "401":
+          description: Authentication is required.
+    put:
+      operationId: updateRuntimeSettings
+      description: Persists and applies settings to executions that start after this update. Running executions keep their original budget snapshot.
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RuntimeSettingsInput"
+      responses:
+        "200":
+          description: Persisted effective settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeSettings"
+        "400":
+          description: A budget, policy profile, timeout, or retention value is invalid.
+  /api/v1/settings/cleanup-preview:
+    get:
+      operationId: previewRetentionCleanup
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Non-mutating count of terminal task data older than the configured retention boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CleanupPreview"
+  /api/v1/settings/cleanup:
+    post:
+      operationId: runRetentionCleanup
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+                  const: true
+      responses:
+        "200":
+          description: Committed task deletion and safely pruned unreferenced content objects.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CleanupResult"
+        "400":
+          description: Explicit confirmation is missing.
+  /api/v1/tasks:
+    get:
+      operationId: listTasks
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Newest tasks first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, tasks]
+                properties:
+                  schema_version:
+                    type: string
+                  tasks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Task"
+    post:
+      operationId: createTask
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [goal]
+              additionalProperties: false
+              properties:
+                title:
+                  type: string
+                goal:
+                  type: string
+                  minLength: 1
+                  maxLength: 20000
+                model_config_id:
+                  type: string
+                  format: uuid
+                plugins:
+                  $ref: "#/components/schemas/TaskPluginSelection"
+                attachments:
+                  type: array
+                  maxItems: 4
+                  description: Images persisted as task-scoped immutable artifacts before execution.
+                  items:
+                    $ref: "#/components/schemas/TaskAttachmentInput"
+      responses:
+        "202":
+          description: Task persisted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: Selected model config is missing or disabled.
+  /api/v1/models:
+    get:
+      operationId: listModelConfigs
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Public-safe model settings. Secret values and references are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, credential_store_available, providers, configs]
+                properties:
+                  schema_version:
+                    type: string
+                  credential_store_available:
+                    type: boolean
+                    description: Whether this Core instance can write raw keys into the local system credential store.
+                  providers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ModelProvider"
+                  configs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ModelConfig"
+  /api/v1/model-configs:
+    post:
+      operationId: createModelConfig
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelConfigInput"
+      responses:
+        "201":
+          description: Model connection saved; only an opaque environment reference is persisted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelConfig"
+        "400":
+          description: Invalid provider, endpoint, model, or environment reference.
+        "409":
+          description: A model config with this name already exists.
+  /api/v1/model-configs/{model_config_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelConfigID"
+    put:
+      operationId: updateModelConfig
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelConfigInput"
+      responses:
+        "200":
+          description: Updated public-safe model connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelConfig"
+        "404":
+          description: Model config not found.
+        "409":
+          description: Model config name conflict.
+    delete:
+      operationId: deleteModelConfig
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Model config deleted. Historical Attempts retain secret-free snapshots.
+        "404":
+          description: Model config not found.
+  /api/v1/model-configs/{model_config_id}/test:
+    parameters:
+      - $ref: "#/components/parameters/ModelConfigID"
+    post:
+      operationId: testModelConfig
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Bounded live provider probe. Response content and credentials are omitted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelConfigTestResult"
+        "404":
+          description: Model config not found.
+        "409":
+          description: Model config is disabled.
+        "502":
+          description: Provider connection or authentication failed.
+  /api/v1/plugins:
+    get:
+      operationId: listPlugins
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Installed plugins. Private installation paths are never exposed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, plugins]
+                properties:
+                  schema_version:
+                    type: string
+                  plugins:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Plugin"
+  /api/v1/plugins/install:
+    post:
+      operationId: installPlugin
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [source]
+              properties:
+                source:
+                  type: string
+                  minLength: 1
+                  maxLength: 4096
+                  description: Local directory visible to the Kern server.
+                enable:
+                  type: boolean
+                  default: false
+      responses:
+        "201":
+          description: Package copied, integrity checked, persisted, and optionally enabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plugin"
+        "200":
+          description: The identical package was already installed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plugin"
+        "400":
+          description: Invalid, incompatible, corrupt, or unsafe package.
+        "409":
+          description: A conflicting version is already installed.
+  /api/v1/plugins/{plugin_id}:
+    parameters:
+      - $ref: "#/components/parameters/PluginID"
+    get:
+      operationId: getPlugin
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Public-safe installed plugin snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plugin"
+        "404":
+          description: Plugin not found.
+    delete:
+      operationId: removePlugin
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Plugin metadata and its quarantined package were removed.
+        "404":
+          description: Plugin not found.
+  /api/v1/plugins/{plugin_id}/enable:
+    parameters:
+      - $ref: "#/components/parameters/PluginID"
+    post:
+      operationId: enablePlugin
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Package integrity was rechecked and the plugin was enabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plugin"
+        "400":
+          description: Installed package no longer passes integrity validation.
+        "404":
+          description: Plugin not found.
+  /api/v1/plugins/{plugin_id}/disable:
+    parameters:
+      - $ref: "#/components/parameters/PluginID"
+    post:
+      operationId: disablePlugin
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Plugin was disabled for future task selection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plugin"
+        "404":
+          description: Plugin not found.
+  /api/v1/tasks/{task_id}:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: getTask
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current task snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "404":
+          description: Task not found.
+  /api/v1/tasks/{task_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: streamTaskEvents
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Persisted task events, replayed after Last-Event-ID.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /api/v1/tasks/{task_id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      operationId: submitTaskInput
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              additionalProperties: false
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  maxLength: 20000
+                attachments:
+                  type: array
+                  maxItems: 4
+                  description: New images added to the inherited task context as immutable artifacts.
+                  items:
+                    $ref: "#/components/schemas/TaskAttachmentInput"
+      responses:
+        "202":
+          description: A new Attempt was created with inherited context, user input, and optional images.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "404":
+          description: Task not found.
+        "409":
+          description: Task is active or has unresolved side effects.
+  /api/v1/tasks/{task_id}/approvals:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: listPendingApprovals
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Exact, unexpired authorization requests pending for this task.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, approvals]
+                properties:
+                  schema_version:
+                    type: string
+                  approvals:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ApprovalRequest"
+  /api/v1/tasks/{task_id}/plan:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: getCurrentTaskPlan
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current Attempt plan, or null when the task is simple enough to run without one.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, plan]
+                properties:
+                  schema_version:
+                    type: string
+                  plan:
+                    oneOf:
+                      - $ref: "#/components/schemas/Plan"
+                      - type: "null"
+        "404":
+          description: Task not found.
+  /api/v1/tasks/{task_id}/verifications:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: listTaskVerifications
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Deterministic checks and aggregate conclusion for the current Attempt.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, attempt_id, verifications]
+                properties:
+                  schema_version:
+                    type: string
+                  attempt_id:
+                    type: string
+                    format: uuid
+                  verifications:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Verification"
+        "404":
+          description: Task not found.
+  /api/v1/tasks/{task_id}/plugins:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: listTaskPlugins
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Exact plugin versions and resources selected for the active Attempt.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, attempt_id, plugins]
+                properties:
+                  schema_version:
+                    type: string
+                  attempt_id:
+                    type: string
+                    format: uuid
+                  plugins:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PluginUsage"
+        "404":
+          description: Task not found.
+  /api/v1/tasks/{task_id}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: listTaskArtifacts
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Immutable content-addressed artifacts owned by this task.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, artifacts]
+                properties:
+                  schema_version:
+                    type: string
+                  artifacts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Artifact"
+        "404":
+          description: Task not found.
+  /api/v1/tasks/{task_id}/operations/uncertain:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: listUncertainOperations
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Interrupted operation outcomes that require an explicit human conclusion.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, operations]
+                properties:
+                  schema_version:
+                    type: string
+                  operations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Operation"
+        "404":
+          description: Task not found.
+  /api/v1/tasks/{task_id}/artifacts/{artifact_id}:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+      - name: artifact_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: downloadTaskArtifact
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Integrity-checked artifact content, returned as an attachment.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Artifact not found for this task.
+        "409":
+          description: Stored artifact failed its integrity check.
+  /api/v1/tasks/{task_id}/pause:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      operationId: pauseTask
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Task durably paused at an execution boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: Task cannot be paused from its current state.
+  /api/v1/tasks/{task_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      operationId: cancelTask
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Task durably cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: Task cannot be cancelled from its current state.
+  /api/v1/tasks/{task_id}/resume:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      operationId: resumeTask
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "202":
+          description: A new attempt was created for the paused task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: Task is not paused.
+  /api/v1/tasks/{task_id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      operationId: retryTask
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "202":
+          description: A new attempt was created for a terminal task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: Task is not terminal.
+  /api/v1/approvals/{request_id}/decision:
+    parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: decideApproval
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved, denied]
+      responses:
+        "200":
+          description: Immutable approval receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApprovalReceipt"
+        "404":
+          description: Approval request not found.
+        "409":
+          description: Approval request has already been decided or expired.
+  /api/v1/operations/{operation_id}/resolution:
+    parameters:
+      - name: operation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: resolveUncertainOperation
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [resolution]
+              properties:
+                resolution:
+                  type: string
+                  enum: [confirmed_succeeded, confirmed_not_executed]
+      responses:
+        "200":
+          description: Immutable human recovery receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationResolutionReceipt"
+        "404":
+          description: Operation not found.
+        "409":
+          description: Operation is no longer uncertain or has a different recorded resolution.
+  /api/v1/evals/runs:
+    get:
+      operationId: listEvaluationRuns
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Newest durable evaluation runs first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, runs]
+                properties:
+                  schema_version:
+                    type: string
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EvaluationRun"
+    post:
+      operationId: startEvaluationRun
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartEvaluationInput"
+      responses:
+        "202":
+          description: Suite validated and evaluation durably queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationRun"
+        "400":
+          description: Invalid suite path, manifest, variant, or plugin source.
+  /api/v1/evals/runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/EvaluationRunID"
+    get:
+      operationId: getEvaluationRun
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Durable evaluation progress snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationRun"
+        "404":
+          description: Evaluation run not found.
+  /api/v1/evals/runs/{run_id}/report:
+    parameters:
+      - $ref: "#/components/parameters/EvaluationRunID"
+    get:
+      operationId: getEvaluationReport
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Immutable reproducible evaluation report.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationReport"
+        "404":
+          description: Evaluation run not found.
+        "409":
+          description: Evaluation report is not ready.
+  /api/v1/evals/runs/{run_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/EvaluationRunID"
+    post:
+      operationId: cancelEvaluationRun
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "202":
+          description: Cancellation requested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationRun"
+        "404":
+          description: Evaluation run not found.
+  /api/v1/evals/runs/{run_id}/pause:
+    parameters:
+      - $ref: "#/components/parameters/EvaluationRunID"
+    post:
+      operationId: pauseEvaluationRun
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "202":
+          description: Active workers stopped after preserving terminal Case/Variant jobs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationRun"
+        "404":
+          description: Evaluation run not found.
+        "409":
+          description: The run cannot be paused from its current state.
+  /api/v1/evals/runs/{run_id}/resume:
+    parameters:
+      - $ref: "#/components/parameters/EvaluationRunID"
+    post:
+      operationId: resumeEvaluationRun
+      security:
+        - sessionCookie: []
+        - bearerAuth: []
+      responses:
+        "202":
+          description: Reproducibility identity revalidated and remaining jobs queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationRun"
+        "404":
+          description: Evaluation run not found.
+        "409":
+          description: Run is not paused or its immutable inputs changed.
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: kern_session
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    TaskID:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ModelConfigID:
+      name: model_config_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PluginID:
+      name: plugin_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+    EvaluationRunID:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    RuntimeSettings:
+      allOf:
+        - $ref: "#/components/schemas/RuntimeSettingsInput"
+        - type: object
+          required: [schema_version]
+          properties:
+            schema_version:
+              type: string
+              const: "1"
+    RuntimeSettingsInput:
+      type: object
+      additionalProperties: false
+      required:
+        - max_turns
+        - max_tool_calls
+        - max_tokens
+        - max_cost_usd
+        - task_timeout
+        - policy_profile
+        - retention_days
+      properties:
+        max_turns:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        max_tool_calls:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 100000000
+        max_cost_usd:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1000000
+        task_timeout:
+          type: string
+          description: Go duration between 1ns and 24h, for example 10m.
+        policy_profile:
+          type: string
+          enum: [local-safe, confirm-all, read-only]
+        retention_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+    CleanupPreview:
+      type: object
+      required: [cutoff, retention_days, task_count, artifact_count, artifact_bytes]
+      properties:
+        cutoff:
+          type: string
+          format: date-time
+        retention_days:
+          type: integer
+          minimum: 1
+        task_count:
+          type: integer
+          minimum: 0
+        artifact_count:
+          type: integer
+          minimum: 0
+        artifact_bytes:
+          type: integer
+          minimum: 0
+    CleanupResult:
+      allOf:
+        - $ref: "#/components/schemas/CleanupPreview"
+        - type: object
+          required: [removed_objects, removed_bytes]
+          properties:
+            removed_objects:
+              type: integer
+              minimum: 0
+            removed_bytes:
+              type: integer
+              minimum: 0
+    Health:
+      type: object
+      required: [schema_version, status, mode]
+      properties:
+        schema_version:
+          type: string
+        status:
+          type: string
+          const: ok
+        mode:
+          type: string
+    StartEvaluationInput:
+      type: object
+      additionalProperties: false
+      required: [suite_path]
+      properties:
+        suite_path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        variants:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+    EvaluationRun:
+      type: object
+      required:
+        - schema_version
+        - id
+        - suite_id
+        - suite_name
+        - suite_version
+        - status
+        - variants
+        - case_count
+        - completed_cases
+        - created_at
+      properties:
+        schema_version:
+          type: string
+        id:
+          type: string
+          format: uuid
+        suite_id:
+          type: string
+        suite_name:
+          type: string
+        suite_version:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, paused, completed, failed, cancelled]
+        variants:
+          type: array
+          items:
+            type: string
+        case_count:
+          type: integer
+          minimum: 1
+        completed_cases:
+          type: integer
+          minimum: 0
+        config_digest:
+          type: string
+        error_message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+    EvaluationUsage:
+      type: object
+      required: [input_tokens, output_tokens, cost_micros, duration_ms, tool_calls, retries, human_interventions, safety_violations]
+      properties:
+        input_tokens: {type: integer}
+        output_tokens: {type: integer}
+        cost_micros: {type: integer, format: int64}
+        duration_ms: {type: integer, format: int64}
+        tool_calls: {type: integer}
+        retries: {type: integer}
+        human_interventions: {type: integer}
+        safety_violations: {type: integer}
+    EvaluationGrade:
+      type: object
+      required: [grader_id, status, score, evidence, reason_code]
+      properties:
+        grader_id: {type: string}
+        status:
+          type: string
+          enum: [passed, failed, error, manual_required]
+        score: {type: number}
+        evidence:
+          type: array
+          items: {type: string}
+        reason_code: {type: string}
+        details:
+          type: object
+          additionalProperties: true
+        usage:
+          $ref: "#/components/schemas/EvaluationUsage"
+    EvaluationCaseResult:
+      type: object
+      required: [case_id, variant_id, attempt, task_status, passed, score, grades, usage, started_at, completed_at]
+      properties:
+        case_id: {type: string}
+        variant_id: {type: string}
+        task_id: {type: string, format: uuid}
+        attempt: {type: integer, minimum: 1}
+        task_status: {type: string}
+        passed: {type: boolean}
+        score: {type: number}
+        grades:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluationGrade"
+        usage:
+          $ref: "#/components/schemas/EvaluationUsage"
+        error: {type: string}
+        started_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    EvaluationVariantMetrics:
+      type: object
+      additionalProperties: true
+      required: [variant_id, cases, passed, success_rate, mean_score]
+      properties:
+        variant_id: {type: string}
+        cases: {type: integer}
+        passed: {type: integer}
+        success_rate: {type: number}
+        mean_score: {type: number}
+    EvaluationComparison:
+      type: object
+      additionalProperties: false
+      required: [baseline_variant, candidate_variant, paired_cases, success_rate_delta, mean_score_delta, success_rate_test, success_rate_p_value, significance_alpha, success_rate_improvement_significant, improvements, regressions, safety_regressed]
+      properties:
+        baseline_variant: {type: string}
+        candidate_variant: {type: string}
+        paired_cases: {type: integer, minimum: 0}
+        success_rate_delta: {type: number}
+        mean_score_delta: {type: number}
+        success_rate_test:
+          type: string
+          enum: [mcnemar_exact_two_sided]
+        success_rate_p_value: {type: number, minimum: 0, maximum: 1}
+        significance_alpha: {type: number, exclusiveMinimum: 0, exclusiveMaximum: 1}
+        success_rate_improvement_significant: {type: boolean}
+        improvements:
+          type: array
+          items: {type: string}
+        regressions:
+          type: array
+          items: {type: string}
+        safety_regressed: {type: boolean}
+    EvaluationDefaults:
+      type: object
+      additionalProperties: false
+      required: [timeout_ms, token_budget, cost_budget_micros, retries, worker_count, allowed_commands]
+      properties:
+        timeout_ms: {type: integer, format: int64, minimum: 1000}
+        token_budget: {type: integer, minimum: 1}
+        cost_budget_micros: {type: integer, format: int64, minimum: 0}
+        retries: {type: integer, minimum: 0}
+        worker_count: {type: integer, minimum: 1}
+        allowed_commands:
+          type: array
+          items: {type: string}
+        judge:
+          $ref: "#/components/schemas/EvaluationJudgeDefinition"
+    EvaluationJudgeDefinition:
+      type: object
+      additionalProperties: false
+      required: [provider, base_url, model, max_tokens]
+      properties:
+        provider:
+          type: string
+          enum: [openai-compatible]
+        base_url:
+          type: string
+          format: uri
+        model: {type: string, minLength: 1, maxLength: 200}
+        api_key_env:
+          type: string
+          pattern: "^[A-Z_][A-Z0-9_]{0,127}$"
+        max_tokens: {type: integer, minimum: 32, maximum: 4096}
+    EvaluationVariantDefinition:
+      type: object
+      additionalProperties: false
+      required: [id, plugins]
+      properties:
+        id: {type: string}
+        agent:
+          type: string
+          enum: [kern, codex]
+        agent_version: {type: string}
+        model: {type: string}
+        plugins:
+          type: array
+          items: {type: string}
+        plugin_digests:
+          type: object
+          additionalProperties:
+            type: string
+            pattern: "^sha256:[0-9a-f]{64}$"
+    EvaluationInputDigest:
+      type: object
+      additionalProperties: false
+      required: [case_id, prompt_sha256, fixture_sha256]
+      properties:
+        case_id: {type: string}
+        prompt_sha256:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        fixture_sha256:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+    EvaluationReproducibility:
+      type: object
+      additionalProperties: false
+      required: [core_version, go_version, goos, goarch, defaults, variants, inputs]
+      properties:
+        core_version: {type: string}
+        go_version: {type: string}
+        goos: {type: string}
+        goarch: {type: string}
+        defaults:
+          $ref: "#/components/schemas/EvaluationDefaults"
+        variants:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluationVariantDefinition"
+        inputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluationInputDigest"
+    EvaluationReport:
+      type: object
+      required: [schema_version, run_id, suite_id, suite_version, status, config_digest, variants, results, reproducibility, started_at, completed_at]
+      properties:
+        schema_version: {type: string}
+        run_id: {type: string, format: uuid}
+        suite_id: {type: string}
+        suite_version: {type: string}
+        status:
+          type: string
+          enum: [completed]
+        config_digest: {type: string}
+        variants:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluationVariantMetrics"
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluationCaseResult"
+        comparisons:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluationComparison"
+        reproducibility:
+          $ref: "#/components/schemas/EvaluationReproducibility"
+        started_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    Task:
+      type: object
+      required:
+        - schema_version
+        - id
+        - trace_id
+        - title
+        - goal
+        - status
+        - result
+        - error_message
+        - active_attempt_id
+        - created_at
+        - updated_at
+      properties:
+        schema_version:
+          type: string
+        id:
+          type: string
+          format: uuid
+        trace_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        title:
+          type: string
+        goal:
+          type: string
+        status:
+          type: string
+          enum:
+            - created
+            - planning
+            - running
+            - waiting_approval
+            - waiting_input
+            - verifying
+            - completed
+            - partially_completed
+            - failed
+            - cancelled
+        result:
+          type: string
+        error_message:
+          type: string
+        active_attempt_id:
+          type: string
+          format: uuid
+        model_config_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        lease_owner:
+          type: string
+        lease_expires_at:
+          type: [string, "null"]
+          format: date-time
+        heartbeat_at:
+          type: [string, "null"]
+          format: date-time
+        paused_from_status:
+          type: string
+    TaskPluginSelection:
+      type: object
+      additionalProperties: false
+      properties:
+        enable:
+          type: array
+          uniqueItems: true
+          maxItems: 100
+          items:
+            type: string
+            pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+        disable:
+          type: array
+          uniqueItems: true
+          maxItems: 100
+          items:
+            type: string
+            pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+    TaskAttachmentInput:
+      type: object
+      additionalProperties: false
+      required: [name, media_type, data]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: One safe file name without path separators.
+        media_type:
+          type: string
+          enum: [image/png, image/jpeg, image/webp, image/gif]
+        data:
+          type: string
+          format: byte
+          description: Standard base64-encoded file bytes; each decoded image is limited to 8 MiB and all images to 12 MiB.
+    ModelProvider:
+      type: string
+      enum: [openai-compatible, ollama]
+    ModelConfig:
+      type: object
+      required:
+        - schema_version
+        - id
+        - name
+        - provider
+        - base_url
+        - model
+        - has_api_key
+        - enabled
+        - is_default
+        - created_at
+        - updated_at
+      properties:
+        schema_version:
+          type: string
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        provider:
+          $ref: "#/components/schemas/ModelProvider"
+        base_url:
+          type: string
+          format: uri
+        model:
+          type: string
+        has_api_key:
+          type: boolean
+        enabled:
+          type: boolean
+        is_default:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ModelConfigInput:
+      type: object
+      additionalProperties: false
+      required: [name, provider, base_url, model]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        provider:
+          $ref: "#/components/schemas/ModelProvider"
+        base_url:
+          type: string
+          format: uri
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+        api_key_env:
+          type: string
+          pattern: "^[A-Z_][A-Z0-9_]{0,127}$"
+          description: Environment variable name only. Mutually exclusive with api_key and clear_api_key.
+        api_key:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Raw key written directly to the local system credential store. It is never returned or stored in SQLite. Mutually exclusive with api_key_env and clear_api_key.
+        clear_api_key:
+          type: boolean
+          description: Remove the current system credential reference. Valid only for updates and mutually exclusive with api_key and api_key_env.
+        enabled:
+          type: boolean
+          default: true
+        set_default:
+          type: boolean
+    ModelConfigTestResult:
+      type: object
+      required: [schema_version, config_id, provider, model, ok, latency_ms, capabilities]
+      properties:
+        schema_version:
+          type: string
+        config_id:
+          type: string
+          format: uuid
+        provider:
+          $ref: "#/components/schemas/ModelProvider"
+        model:
+          type: string
+        ok:
+          type: boolean
+        latency_ms:
+          type: integer
+          minimum: 0
+        request_id:
+          type: string
+        capabilities:
+          type: object
+          additionalProperties:
+            type: boolean
+    Plugin:
+      type: object
+      required:
+        - schema_version
+        - id
+        - name
+        - version
+        - source
+        - digest
+        - enabled
+        - trust_status
+        - manifest
+        - installed_at
+        - updated_at
+      properties:
+        schema_version:
+          type: string
+          const: "1"
+        id:
+          type: string
+          pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+        name:
+          type: string
+        description:
+          type: string
+        version:
+          type: string
+        source:
+          type: string
+        digest:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        enabled:
+          type: boolean
+        trust_status:
+          type: string
+          enum: [local-unverified, verified, revoked]
+        manifest:
+          $ref: "#/components/schemas/PluginManifest"
+        installed_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PluginManifest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, name, version, core, entrypoints, activation, permissions, integrity]
+      properties:
+        schema_version:
+          type: string
+          const: "1"
+        id:
+          type: string
+          pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 1000
+        version:
+          type: string
+          pattern: "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+        core:
+          type: string
+        entrypoints:
+          $ref: "#/components/schemas/PluginEntrypoints"
+        activation:
+          $ref: "#/components/schemas/PluginActivation"
+        permissions:
+          $ref: "#/components/schemas/PluginPermissions"
+        integrity:
+          type: object
+          additionalProperties: false
+          required: [files]
+          properties:
+            files:
+              type: string
+              pattern: "^sha256:[0-9a-f]{64}$"
+    PluginEntrypoints:
+      type: object
+      additionalProperties: false
+      properties:
+        knowledge:
+          type: array
+          items: { type: string }
+        workflows:
+          type: array
+          items: { type: string }
+        rules:
+          type: array
+          items: { type: string }
+        tools:
+          type: array
+          items: { type: string }
+        verifiers:
+          type: array
+          items: { type: string }
+        evals:
+          type: array
+          items: { type: string }
+    PluginActivation:
+      type: object
+      additionalProperties: false
+      properties:
+        signals:
+          type: array
+          items: { type: string }
+        intents:
+          type: array
+          items: { type: string }
+    PluginPermissions:
+      type: object
+      additionalProperties: false
+      properties:
+        filesystem:
+          type: array
+          items:
+            type: string
+            enum: ["workspace:read", "workspace:write"]
+        process:
+          type: array
+          items:
+            type: string
+    PluginUsage:
+      type: object
+      required: [schema_version, task_id, attempt_id, plugin_id, version, digest, reason, resources, created_at]
+      properties:
+        schema_version:
+          type: string
+          const: "1"
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        plugin_id:
+          type: string
+          pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+        version:
+          type: string
+        digest:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        reason:
+          type: string
+        resources:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        created_at:
+          type: string
+          format: date-time
+    ApprovalRequest:
+      type: object
+      required:
+        - id
+        - task_id
+        - attempt_id
+        - operation_id
+        - scope
+        - risk
+        - explanation
+        - status
+        - expires_at
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        operation_id:
+          type: string
+          format: uuid
+        scope:
+          type: object
+          additionalProperties: true
+        risk:
+          type: string
+          enum: [low, medium, high, critical]
+        explanation:
+          type: string
+        status:
+          type: string
+          const: pending
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    ApprovalReceipt:
+      type: object
+      required: [id, request_id, decision, actor, scope, decided_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        request_id:
+          type: string
+          format: uuid
+        decision:
+          type: string
+          enum: [approved, denied]
+        actor:
+          type: string
+        scope:
+          type: object
+          additionalProperties: true
+        decided_at:
+          type: string
+          format: date-time
+    Artifact:
+      type: object
+      required:
+        - schema_version
+        - id
+        - task_id
+        - attempt_id
+        - name
+        - digest
+        - media_type
+        - size
+        - created_at
+      properties:
+        schema_version:
+          type: string
+        id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        media_type:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+        source_operation_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+    Operation:
+      type: object
+      required:
+        - id
+        - task_id
+        - attempt_id
+        - tool
+        - input
+        - input_hash
+        - idempotency_key
+        - effect
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        tool:
+          type: string
+        input:
+          description: Validated tool input proposed by the model.
+        input_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        idempotency_key:
+          type: string
+        effect:
+          type: string
+          enum: [read, local_write, process, network_read, network_write, destructive]
+        status:
+          type: string
+          const: unknown
+        output_summary:
+          type: string
+        error_code:
+          type: string
+        recovery:
+          type: object
+          description: Content-free tool-specific metadata persisted before execution for crash reconciliation.
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    OperationResolutionReceipt:
+      type: object
+      required: [id, operation_id, task_id, attempt_id, resolution, actor, decided_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        operation_id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        resolution:
+          type: string
+          enum: [confirmed_succeeded, confirmed_not_executed]
+        actor:
+          type: string
+        decided_at:
+          type: string
+          format: date-time
+    Plan:
+      type: object
+      required:
+        - schema_version
+        - id
+        - task_id
+        - attempt_id
+        - revision
+        - status
+        - rationale
+        - steps
+        - created_at
+        - updated_at
+      properties:
+        schema_version:
+          type: string
+        id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [active, completed, failed, superseded]
+        rationale:
+          type: string
+        steps:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/PlanStep"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PlanStep:
+      type: object
+      required:
+        - id
+        - plan_id
+        - ordinal
+        - title
+        - description
+        - phase
+        - required
+        - status
+        - failure
+        - retry_count
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+        ordinal:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+        description:
+          type: string
+        phase:
+          type: string
+          enum: [prepare, execute, verify]
+        required:
+          type: boolean
+        status:
+          type: string
+          enum: [pending, running, completed, failed, skipped]
+        failure:
+          type: string
+        retry_count:
+          type: integer
+          minimum: 0
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Verification:
+      type: object
+      required: [id, task_id, attempt_id, verifier, status, evidence, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        verifier:
+          type: string
+        status:
+          type: string
+          enum: [passed, failed, partial, manual_required, not_run, verified]
+        evidence:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time

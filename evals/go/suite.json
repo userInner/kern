@@ -1,0 +1,213 @@
+{
+  "schema_version": "1",
+  "id": "kern.go.reference",
+  "name": "Kern Go Expert reference evaluation",
+  "version": "0.1.0",
+  "defaults": {
+    "timeout_ms": 300000,
+    "token_budget": 200000,
+    "cost_budget_micros": 5000000,
+    "retries": 1,
+    "worker_count": 2,
+    "allowed_commands": ["go", "gofmt"]
+  },
+  "variants": [
+    {
+      "id": "general.base",
+      "plugins": []
+    },
+    {
+      "id": "expert.go",
+      "plugins": ["dev.kern.go-expert@0.1.0"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "go.off-by-one",
+      "fixture": "fixtures/off-by-one",
+      "prompt": "prompts/off-by-one.md",
+      "graders": [
+        {
+          "id": "go.test-all",
+          "type": "command",
+          "required": true,
+          "command": ["go", "test", "./..."]
+        }
+      ]
+    },
+    {
+      "id": "go.nil-map-initialization",
+      "fixture": "fixtures/nil-map-initialization",
+      "prompt": "prompts/nil-map-initialization.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.slice-aliasing",
+      "fixture": "fixtures/slice-aliasing",
+      "prompt": "prompts/slice-aliasing.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.error-wrapping",
+      "fixture": "fixtures/error-wrapping",
+      "prompt": "prompts/error-wrapping.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.context-propagation",
+      "fixture": "fixtures/context-propagation",
+      "prompt": "prompts/context-propagation.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.path-traversal",
+      "fixture": "fixtures/path-traversal",
+      "prompt": "prompts/path-traversal.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.http-status",
+      "fixture": "fixtures/http-status",
+      "prompt": "prompts/http-status.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.json-strict-decoding",
+      "fixture": "fixtures/json-strict-decoding",
+      "prompt": "prompts/json-strict-decoding.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.partial-writer",
+      "fixture": "fixtures/partial-writer",
+      "prompt": "prompts/partial-writer.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.cache-copy-boundary",
+      "fixture": "fixtures/cache-copy-boundary",
+      "prompt": "prompts/cache-copy-boundary.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.concurrent-map",
+      "fixture": "fixtures/concurrent-map",
+      "prompt": "prompts/concurrent-map.md",
+      "graders": [{"id": "go.test-race", "type": "command", "required": true, "command": ["go", "test", "-race", "./..."]}]
+    },
+    {
+      "id": "go.worker-cancellation",
+      "fixture": "fixtures/worker-cancellation",
+      "prompt": "prompts/worker-cancellation.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.callback-deadlock",
+      "fixture": "fixtures/callback-deadlock",
+      "prompt": "prompts/callback-deadlock.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.idempotent-stop",
+      "fixture": "fixtures/idempotent-stop",
+      "prompt": "prompts/idempotent-stop.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.semaphore-release",
+      "fixture": "fixtures/semaphore-release",
+      "prompt": "prompts/semaphore-release.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.request-body-limit",
+      "fixture": "fixtures/request-body-limit",
+      "prompt": "prompts/request-body-limit.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.url-allowlist",
+      "fixture": "fixtures/url-allowlist",
+      "prompt": "prompts/url-allowlist.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.zip-slip",
+      "fixture": "fixtures/zip-slip",
+      "prompt": "prompts/zip-slip.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.integer-overflow",
+      "fixture": "fixtures/integer-overflow",
+      "prompt": "prompts/integer-overflow.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.deep-copy",
+      "fixture": "fixtures/deep-copy",
+      "prompt": "prompts/deep-copy.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.stable-deduplication",
+      "fixture": "fixtures/stable-deduplication",
+      "prompt": "prompts/stable-deduplication.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.sort-copy-boundary",
+      "fixture": "fixtures/sort-copy-boundary",
+      "prompt": "prompts/sort-copy-boundary.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.pagination-boundary",
+      "fixture": "fixtures/pagination-boundary",
+      "prompt": "prompts/pagination-boundary.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.time-range-boundary",
+      "fixture": "fixtures/time-range-boundary",
+      "prompt": "prompts/time-range-boundary.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.config-presence",
+      "fixture": "fixtures/config-presence",
+      "prompt": "prompts/config-presence.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.transaction-rollback",
+      "fixture": "fixtures/transaction-rollback",
+      "prompt": "prompts/transaction-rollback.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.error-aggregation",
+      "fixture": "fixtures/error-aggregation",
+      "prompt": "prompts/error-aggregation.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.retry-cancellation",
+      "fixture": "fixtures/retry-cancellation",
+      "prompt": "prompts/retry-cancellation.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.filename-sanitization",
+      "fixture": "fixtures/filename-sanitization",
+      "prompt": "prompts/filename-sanitization.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    },
+    {
+      "id": "go.secret-redaction",
+      "fixture": "fixtures/secret-redaction",
+      "prompt": "prompts/secret-redaction.md",
+      "graders": [{"id": "go.test-all", "type": "command", "required": true, "command": ["go", "test", "./..."]}]
+    }
+  ]
+}

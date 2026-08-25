@@ -1,0 +1,20 @@
+{
+  "name": "@userinner/kern-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Kern Core HTTP API",
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2"
+  }
+}

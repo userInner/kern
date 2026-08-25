@@ -1,0 +1,33 @@
+{
+  "schema_version": "1",
+  "id": "dev.kern.go-expert",
+  "name": "Go Expert",
+  "description": "Adds repository-aware Go workflows, lifecycle and concurrency risk rules, and deterministic test/vet/race evidence without replacing Kern's general coding ability.",
+  "version": "0.1.0",
+  "core": ">=0.1.0 <0.2.0",
+  "entrypoints": {
+    "knowledge": ["knowledge/principles.md"],
+    "workflows": [
+      "workflows/bug-fix.json",
+      "workflows/concurrency-review.json",
+      "workflows/implementation.json"
+    ],
+    "rules": ["rules/risk-rules.json"],
+    "verifiers": [
+      "verifiers/go-test.json",
+      "verifiers/go-vet.json",
+      "verifiers/go-race.json"
+    ]
+  },
+  "activation": {
+    "signals": ["go.mod", "go.work", "**/*.go"],
+    "intents": ["code.fix", "code.review", "code.test", "code.implement"]
+  },
+  "permissions": {
+    "filesystem": ["workspace:read", "workspace:write"],
+    "process": ["go", "gofmt"]
+  },
+  "integrity": {
+    "files": "sha256:ca8c0f1db08d0611411bb331c40ba42d93385b5c7944204491106b7b58416f1e"
+  }
+}

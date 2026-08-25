@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "id": "go.implementation",
+  "name": "Go implementation",
+  "description": "Implements a requested Go change while preserving API, lifecycle, and repository constraints.",
+  "intents": ["code.implement", "code.review"],
+  "steps": [
+    {
+      "phase": "prepare",
+      "instruction": "Translate the request into observable acceptance criteria. Inspect module versions, call sites, interfaces, errors, tests, configuration, and repository conventions before choosing an API."
+    },
+    {
+      "phase": "execute",
+      "instruction": "Implement the smallest cohesive design with explicit dependencies, bounded resource use, caller context propagation, safe zero values, and compatibility at public or serialized boundaries."
+    },
+    {
+      "phase": "verify",
+      "instruction": "Add behavior-focused tests for success and important failures, format touched files, and run exactly `go test ./...` plus exactly `go vet ./...`. Use race, integration, or benchmark checks when the change creates those risks."
+    }
+  ]
+}

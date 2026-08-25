@@ -1,0 +1,95 @@
+{
+  "schema_version": "1",
+  "rules": [
+    {
+      "id": "go.repository_constraints",
+      "description": "Inspect module versions, repository instructions, generated-file markers, and nearby conventions before changing Go code.",
+      "severity": "error",
+      "phases": ["prepare"]
+    },
+    {
+      "id": "go.no_unapproved_dependency",
+      "description": "Do not add, upgrade, download, or tidy dependencies unless the user authorized that change.",
+      "severity": "error",
+      "phases": ["prepare", "execute"]
+    },
+    {
+      "id": "go.public_compatibility",
+      "description": "Preserve exported APIs, serialized fields, command flags, and documented error behavior unless a breaking change is explicitly authorized.",
+      "severity": "error",
+      "phases": ["prepare", "execute"]
+    },
+    {
+      "id": "go.context_propagation",
+      "description": "Propagate caller context through blocking operations; do not store context in structs or silently replace it on active request paths.",
+      "severity": "error",
+      "phases": ["execute"]
+    },
+    {
+      "id": "go.goroutine_lifecycle",
+      "description": "Every new goroutine must have explicit ownership, bounded work, cancellation, error propagation, and a verifiable exit path.",
+      "severity": "error",
+      "phases": ["execute", "verify"]
+    },
+    {
+      "id": "go.shared_state",
+      "description": "Audit all accesses to shared maps, slices, pointers, and lifecycle flags; choose channels or locks according to ownership and run race verification when relevant.",
+      "severity": "error",
+      "phases": ["execute", "verify"]
+    },
+    {
+      "id": "go.resource_cleanup",
+      "description": "Close files, response bodies, rows, timers, tickers, and owned processes deterministically on success, failure, and cancellation paths.",
+      "severity": "error",
+      "phases": ["execute", "verify"]
+    },
+    {
+      "id": "go.error_contract",
+      "description": "Check errors, add operation context while preserving inspectable causes, and avoid both logging and returning the same failure without a boundary reason.",
+      "severity": "warning",
+      "phases": ["execute", "verify"]
+    },
+    {
+      "id": "go.transaction_boundary",
+      "description": "Keep related database operations on one explicit transaction, defer rollback, commit once, and intentionally select locking or isolation for read-modify-write invariants.",
+      "severity": "error",
+      "phases": ["execute", "verify"]
+    },
+    {
+      "id": "go.untrusted_boundary",
+      "description": "Validate paths, URLs, commands, archive entries, sizes, and counts before use; prevent traversal, injection, SSRF, and secret disclosure.",
+      "severity": "error",
+      "phases": ["prepare", "execute", "verify"]
+    },
+    {
+      "id": "go.regression_test",
+      "description": "A defect fix should include a deterministic regression test that demonstrates the original root cause when practical.",
+      "severity": "warning",
+      "phases": ["execute", "verify"]
+    },
+    {
+      "id": "go.format_touched_files",
+      "description": "Run gofmt on every touched Go file and avoid unrelated repository-wide formatting.",
+      "severity": "error",
+      "phases": ["verify"]
+    },
+    {
+      "id": "go.test_all",
+      "description": "Run the focused test and then the repository-wide Go test suite; report packages or environments that were not exercised.",
+      "severity": "error",
+      "phases": ["verify"]
+    },
+    {
+      "id": "go.vet",
+      "description": "Run go vet across the module when supported and report any skipped generated, platform, or integration code.",
+      "severity": "warning",
+      "phases": ["verify"]
+    },
+    {
+      "id": "go.evidence_not_assertion",
+      "description": "Final claims must reference exact command, exit code, test, artifact, or file hash evidence rather than model confidence.",
+      "severity": "error",
+      "phases": ["verify"]
+    }
+  ]
+}

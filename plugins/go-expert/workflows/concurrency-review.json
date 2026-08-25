@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "id": "go.concurrency_review",
+  "name": "Go concurrency review",
+  "description": "Reviews ownership, cancellation, shared state, and goroutine lifetime before validating with the race detector.",
+  "intents": ["code.fix", "code.review", "code.implement"],
+  "steps": [
+    {
+      "phase": "prepare",
+      "instruction": "Map every goroutine owner, shutdown path, channel closer, context boundary, shared mutable value, timer, and blocking operation in scope. Identify how errors and cancellation reach the caller."
+    },
+    {
+      "phase": "execute",
+      "instruction": "Keep concurrency bounded and explicit. Prefer synchronous flow when concurrency adds no measurable value. Ensure each goroutine can terminate on success, failure, cancellation, and early return without leaking or blocking a sender."
+    },
+    {
+      "phase": "verify",
+      "instruction": "Use deterministic synchronization tests instead of sleeps. Run the focused test repeatedly when useful, then exactly `go test ./...`, exactly `go vet ./...`, and exactly `go test -race ./...`. Treat an unavailable race run as an explicit coverage gap."
+    }
+  ]
+}

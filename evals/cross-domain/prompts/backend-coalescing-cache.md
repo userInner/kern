@@ -1,0 +1,1 @@
+Repair `cache.go`. Cache successful values, coalesce concurrent loads for the same key, do not cache failures, permit different keys to load independently, and let a waiting caller return on its own context cancellation without cancelling the shared load. Make the implementation race-free. Do not change tests or other files. Run `go test -race ./...`.

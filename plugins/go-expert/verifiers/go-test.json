@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "id": "go.test_all",
+  "description": "The complete Go package test suite passed through the Core execute tool.",
+  "type": "command",
+  "required": true,
+  "command": ["go", "test", "./..."]
+}

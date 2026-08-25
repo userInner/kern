@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "id": "go.bug_fix",
+  "name": "Go defect repair",
+  "description": "A bounded reproduce-fix-verify workflow for Go defects.",
+  "intents": ["code.fix", "code.test"],
+  "steps": [
+    {
+      "phase": "prepare",
+      "instruction": "Inspect go.mod/go.work, repository instructions, the failing path, nearby tests, and generated-file markers. Reproduce the narrow failure when practical and identify the violated invariant before editing."
+    },
+    {
+      "phase": "execute",
+      "instruction": "Add or strengthen a regression test for the root cause, then make the smallest complete fix. Preserve public compatibility and existing package boundaries; avoid unrelated refactors and new dependencies."
+    },
+    {
+      "phase": "verify",
+      "instruction": "Format every touched Go file, run the focused regression test, then run exactly `go test ./...`. Also run exactly `go vet ./...` when supported. If concurrency changed, run exactly `go test -race ./...`; report any check that could not run."
+    }
+  ]
+}

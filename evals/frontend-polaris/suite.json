@@ -1,0 +1,29 @@
+{
+  "schema_version": "1",
+  "id": "kern.frontend-visual.polaris",
+  "name": "POLARIS responsive operations-console challenge",
+  "version": "1.0.0",
+  "defaults": {
+    "timeout_ms": 600000,
+    "token_budget": 200000,
+    "cost_budget_micros": 3000000,
+    "retries": 0,
+    "worker_count": 2,
+    "allowed_commands": ["node"]
+  },
+  "variants": [
+    {"id": "general.base", "plugins": []}
+  ],
+  "cases": [
+    {
+      "id": "frontend.polaris-console",
+      "fixture": "fixtures/polaris",
+      "prompt": "prompts/polaris.md",
+      "graders": [
+        {"id": "contract.tests", "type": "command", "required": true, "command": ["node", "--test"]},
+        {"id": "javascript.syntax", "type": "command", "required": true, "command": ["node", "--check", "app.js"]},
+        {"id": "scope.patch", "type": "patch_rule", "required": true, "allowed_paths": ["index.html", "styles.css", "app.js"], "min_changed_files": 3, "max_changed_files": 3}
+      ]
+    }
+  ]
+}
